@@ -49,10 +49,13 @@ def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset,CIR
     Extract FashionIQ or CIRR index features
     :param dataset: FashionIQ or CIRR dataset in 'classic' mode
     :param clip_model: CLIP model
+    :param save_memory: if True, move features to CPU to save GPU memory
     :return: a tensor of features and a list of images
     """
-    classic_val_loader = DataLoader(dataset=dataset, batch_size=64, num_workers=2,
-                                    pin_memory=True, collate_fn=collate_fn)
+    # Use smaller batch size for better memory efficiency
+    batch_size = 32 if save_memory else 64
+    classic_val_loader = DataLoader(dataset=dataset, batch_size=batch_size, num_workers=2,
+                                    pin_memory=False if save_memory else True, collate_fn=collate_fn)
     index_features = []
     index_features_raw = []
     index_names = []
@@ -64,12 +67,18 @@ def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset,CIR
         images = images.to(device, non_blocking=True)
         with torch.no_grad():
             image_features, image_embeds_frozen = blip_model.extract_target_features(images,  mode="mean")
+            # Move to CPU immediately if save_memory is enabled
             if save_memory:
                 image_features = image_features.cpu()
                 image_embeds_frozen = image_embeds_frozen.cpu()
             index_features.append(image_features)
             index_features_raw.append(image_embeds_frozen)
             index_names.extend(names)
+        
+        # Clear cache after each batch when save_memory is enabled
+        if save_memory:
+            del images
+            torch.cuda.empty_cache()
     
     index_features = torch.vstack(index_features)
     index_features_raw = torch.vstack(index_features_raw)

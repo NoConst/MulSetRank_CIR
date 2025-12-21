@@ -43,7 +43,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
     def __init__(
         self,
-        vit_model="eva_clip_g",
+        vit_model="clip_L",
         img_size=224,
         drop_path_rate=0,
         use_grad_checkpoint=False,

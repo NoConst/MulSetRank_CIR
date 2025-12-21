@@ -157,12 +157,15 @@ def generate_fiq_val_predictions(blip_model, relative_val_dataset: FashionIQData
                             features
     :param index_features: validation index features
     :param index_names: validation index names
+    :param save_memory: if True, use memory-efficient mode
     :return: predicted features and target names
     """
     print(f"Compute FashionIQ {relative_val_dataset.dress_types} validation predictions")
 
-    relative_val_loader = DataLoader(dataset=relative_val_dataset, batch_size=16,
-                                     num_workers=4, pin_memory=True, collate_fn=collate_fn,
+    # Use smaller batch size for better memory efficiency
+    batch_size = 16 if save_memory else 32
+    relative_val_loader = DataLoader(dataset=relative_val_dataset, batch_size=batch_size,
+                                     num_workers=4, pin_memory=False if save_memory else True, collate_fn=collate_fn,
                                      shuffle=False)
 
     # Get a mapping from index names to index features
@@ -195,9 +198,16 @@ def generate_fiq_val_predictions(blip_model, relative_val_dataset: FashionIQData
             if save_memory:
                 feature_curr = feature_curr.to(blip_model.device)
                 reference_image_features = reference_image_features.to(blip_model.device)
+            
             batch_distance = blip_model.inference(reference_image_features, feature_curr, input_captions)
-            distance.append(batch_distance)
+            # Move distance to CPU to save GPU memory
+            distance.append(batch_distance.cpu() if save_memory else batch_distance)
             captions_all += input_captions
+            
+            # Clear cache for memory efficiency
+            if save_memory:
+                del reference_image_features, feature_curr
+                torch.cuda.empty_cache()
 
         target_names.extend(batch_target_names)
         reference_names_all.extend(reference_names)
@@ -230,7 +240,7 @@ def fashioniq_val_retrieval(dress_type: str, combining_function: callable, clip_
 
 
 def compute_cirr_val_metrics(relative_val_dataset: CIRRDataset, blip_model, index_features,
-                             index_names: List[str], txt_processors) -> Tuple[
+                             index_names: List[str], txt_processors, save_memory=False) -> Tuple[
     float, float, float, float, float, float, float]:
     """
     Compute validation metrics on CIRR dataset
@@ -240,11 +250,12 @@ def compute_cirr_val_metrics(relative_val_dataset: CIRRDataset, blip_model, inde
     :param index_names: validation index names
     :param combining_function: function which takes as input (image_features, text_features) and outputs the combined
                             features
+    :param save_memory: if True, use memory-efficient mode
     :return: the computed validation metrics
     """
     # Generate predictions
     pred_sim, reference_names, target_names, group_members, captions_all = \
-        generate_cirr_val_predictions(blip_model, relative_val_dataset, index_names, index_features, txt_processors)
+        generate_cirr_val_predictions(blip_model, relative_val_dataset, index_names, index_features, txt_processors, save_memory)
 
     print("Compute CIRR validation metrics")
     if 'the animal is now standing and by himself' in captions_all or "dev-190-0-img0" in reference_names:
@@ -357,7 +368,7 @@ def get_results(distances,index_names, reference_names, target_names, group_memb
 
 
 def generate_cirr_val_predictions(blip_model, relative_val_dataset: CIRRDataset, 
-                                  index_names: List[str], index_features, txt_processors) -> \
+                                  index_names: List[str], index_features, txt_processors, save_memory=False) -> \
         Tuple[torch.tensor, List[str], List[str], List[List[str]]]:
     """
     Compute CIRR predictions on the validation set
@@ -367,11 +378,14 @@ def generate_cirr_val_predictions(blip_model, relative_val_dataset: CIRRDataset,
                             features
     :param index_features: validation index features
     :param index_names: validation index names
+    :param save_memory: if True, use memory-efficient mode
     :return: predicted features, reference names, target names and group members
     """
     print("Compute CIRR validation predictions")
-    relative_val_loader = DataLoader(dataset=relative_val_dataset, batch_size=32, num_workers=2,
-                                     pin_memory=True, collate_fn=collate_fn)
+    # Use smaller batch size for better memory efficiency
+    batch_size = 16 if save_memory else 32
+    relative_val_loader = DataLoader(dataset=relative_val_dataset, batch_size=batch_size, num_workers=2,
+                                     pin_memory=False if save_memory else True, collate_fn=collate_fn)
 
     # Get a mapping from index names to index features
     name_to_feat = dict(zip(index_names, index_features[1]))
@@ -397,9 +411,20 @@ def generate_cirr_val_predictions(blip_model, relative_val_dataset: CIRRDataset,
             else:
                 reference_image_features = torch.stack(itemgetter(*batch_reference_names)(
                     name_to_feat))  # To avoid unnecessary computation retrieve the reference image features directly from the index features
-            batch_distance = blip_model.inference(reference_image_features, index_features[0], captions)
-            distance.append(batch_distance)
+            feature_curr = index_features[0]
+            if save_memory:
+                feature_curr = feature_curr.to(blip_model.device)
+                reference_image_features = reference_image_features.to(blip_model.device)
+            
+            batch_distance = blip_model.inference(reference_image_features, feature_curr, captions)
+            # Move distance to CPU to save GPU memory
+            distance.append(batch_distance.cpu() if save_memory else batch_distance)
             captions_all += captions
+            
+            # Clear cache for memory efficiency
+            if save_memory:
+                del reference_image_features, feature_curr
+                torch.cuda.empty_cache()
 
         target_names.extend(batch_target_names)
         group_members.extend(batch_group_members)

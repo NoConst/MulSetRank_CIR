@@ -9,7 +9,11 @@ from torch.utils.data import Dataset
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 import torch 
 
+# Project base path (for saving models, outputs, etc.)
 base_path = Path(__file__).absolute().parents[1].absolute()
+
+# Dataset path (where the datasets are stored)
+dataset_path = Path("/root/siton-data-92a7d2fc7b594215b07e48fd8818598b/CAM-CIR_backup/datasets")
 
 def collate_fn(batch):
     '''
@@ -146,13 +150,13 @@ class FashionIQDataset(Dataset):
         # get triplets made by (reference_image, target_image, a pair of relative captions)
         self.triplets: List[dict] = []
         for dress_type in dress_types:
-            with open(base_path / 'fashionIQ_dataset' / 'captions' / f'cap.{dress_type}.{split}.json') as f:
+            with open(dataset_path / 'fashionIQ_dataset' / 'captions' / f'cap.{dress_type}.{split}.json') as f:
                 self.triplets.extend(json.load(f))
 
         # get the image names
         self.image_names: list = []
         for dress_type in dress_types:
-            with open(base_path / 'fashionIQ_dataset' / 'image_splits' / f'split.{dress_type}.{split}.json') as f:
+            with open(dataset_path / 'fashionIQ_dataset' / 'image_splits' / f'split.{dress_type}.{split}.json') as f:
                 self.image_names.extend(json.load(f))
 
         print(f"FashionIQ {split} - {dress_types} dataset in {mode} mode initialized")
@@ -164,10 +168,10 @@ class FashionIQDataset(Dataset):
                 reference_name = self.triplets[index]['candidate']
 
                 if self.split == 'train':
-                    reference_image_path = base_path / 'fashionIQ_dataset' / 'images' / f"{reference_name}.png"
+                    reference_image_path = dataset_path / 'fashionIQ_dataset' / 'images' / f"{reference_name}.png"
                     reference_image = self.preprocess(PIL.Image.open(reference_image_path))
                     target_name = self.triplets[index]['target']
-                    target_image_path = base_path / 'fashionIQ_dataset' / 'images' / f"{target_name}.png"
+                    target_image_path = dataset_path / 'fashionIQ_dataset' / 'images' / f"{target_name}.png"
                     target_image = self.preprocess(PIL.Image.open(target_image_path))
                     return reference_image, target_image, image_captions
 
@@ -176,13 +180,13 @@ class FashionIQDataset(Dataset):
                     return reference_name, target_name, image_captions
 
                 elif self.split == 'test':
-                    reference_image_path = base_path / 'fashionIQ_dataset' / 'images' / f"{reference_name}.png"
+                    reference_image_path = dataset_path / 'fashionIQ_dataset' / 'images' / f"{reference_name}.png"
                     reference_image = self.preprocess(PIL.Image.open(reference_image_path))
                     return reference_name, reference_image, image_captions
 
             elif self.mode == 'classic':
                 image_name = self.image_names[index]
-                image_path = base_path / 'fashionIQ_dataset' / 'images' / f"{image_name}.png"
+                image_path = dataset_path / 'fashionIQ_dataset' / 'images' / f"{image_name}.png"
                 image = self.preprocess(PIL.Image.open(image_path))
                 return image_name, image
 
@@ -232,11 +236,11 @@ class CIRRDataset(Dataset):
             raise ValueError("mode should be in ['relative', 'classic']")
 
         # get triplets made by (reference_image, target_image, relative caption)
-        with open(base_path / 'cirr_dataset' / 'cirr' / 'captions' / f'cap.rc2.{split}.json') as f:
+        with open(dataset_path / 'cirr_dataset' / 'CIRR' / 'cirr' / 'captions' / f'cap.rc2.{split}.json') as f:
             self.triplets = json.load(f)
 
         # get a mapping from image name to relative path
-        with open(base_path / 'cirr_dataset' / 'cirr' / 'image_splits' / f'split.rc2.{split}.json') as f:
+        with open(dataset_path / 'cirr_dataset' / 'CIRR' / 'cirr' / 'image_splits' / f'split.rc2.{split}.json') as f:
             self.name_to_relpath = json.load(f)
 
         print(f"CIRR {split} dataset in {mode} mode initialized")
@@ -249,10 +253,10 @@ class CIRRDataset(Dataset):
                 rel_caption = self.triplets[index]['caption']
 
                 if self.split == 'train':
-                    reference_image_path = base_path / 'cirr_dataset' / self.name_to_relpath[reference_name]
+                    reference_image_path = dataset_path / 'cirr_dataset' / 'CIRR' / self.name_to_relpath[reference_name]
                     reference_image = self.preprocess(PIL.Image.open(reference_image_path))
                     target_hard_name = self.triplets[index]['target_hard']
-                    target_image_path = base_path / 'cirr_dataset' / self.name_to_relpath[target_hard_name]
+                    target_image_path = dataset_path / 'cirr_dataset' / 'CIRR' / self.name_to_relpath[target_hard_name]
                     target_image = self.preprocess(PIL.Image.open(target_image_path))
                     return reference_image, target_image, rel_caption
 
@@ -266,7 +270,7 @@ class CIRRDataset(Dataset):
 
             elif self.mode == 'classic':
                 image_name = list(self.name_to_relpath.keys())[index]
-                image_path = base_path / 'cirr_dataset' / self.name_to_relpath[image_name]
+                image_path = dataset_path / 'cirr_dataset' / 'CIRR' / self.name_to_relpath[image_name]
                 im = PIL.Image.open(image_path)
                 image = self.preprocess(im)
                 return image_name, image

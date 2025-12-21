@@ -166,12 +166,18 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
             for relative_val_dataset, classic_val_dataset, idx in zip(relative_val_datasets, classic_val_datasets,
                                                                         idx_to_dress_mapping):
              
-                index_features, index_names = extract_index_blip_features(classic_val_dataset, blip_model, save_memory)
+                print(f"Extracting index features for {idx_to_dress_mapping[idx]}...")
+                torch.cuda.empty_cache()  # Clear cache before validation
+                
+                index_features, index_names = extract_index_blip_features(classic_val_dataset, blip_model, save_memory=True)
                 recall_at10, recall_at50 = compute_fiq_val_metrics(relative_val_dataset, blip_model,
-                                                                    index_features, index_names, txt_processors, save_memory)
+                                                                    index_features, index_names, txt_processors, save_memory=True)
                 
                 recalls_at10.append(recall_at10)
                 recalls_at50.append(recall_at50)
+                
+                # Clear memory after each validation
+                del index_features, index_names
                 torch.cuda.empty_cache()
 
             results_dict = {}
@@ -332,11 +338,15 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
 
         if epoch % validation_frequency == 0:
             blip_model.eval()
-                # extract target image features
-            val_index_features, val_index_names = extract_index_blip_features(classic_val_dataset, blip_model)
+            
+            print("Extracting CIRR validation index features...")
+            torch.cuda.empty_cache()  # Clear cache before validation
+            
+            # extract target image features
+            val_index_features, val_index_names = extract_index_blip_features(classic_val_dataset, blip_model, save_memory=True)
             # 
             results = compute_cirr_val_metrics(relative_val_dataset, blip_model, val_index_features,
-                                                val_index_names, txt_processors)
+                                                val_index_names, txt_processors, save_memory=True)
             group_recall_at1, group_recall_at2, group_recall_at3, recall_at1, recall_at5, recall_at10, recall_at50 = results
 
             results_dict = {
@@ -353,6 +363,10 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                 'geometric_mean': geometric_mean(results)
             }
             print(json.dumps(results_dict, indent=4))
+            
+            # Clear memory after validation
+            del val_index_features, val_index_names
+            torch.cuda.empty_cache()
             # Validation CSV logging
             log_dict = {'epoch': epoch}
             log_dict.update(results_dict)
