@@ -25,6 +25,7 @@ from validate_blip import compute_cirr_val_metrics, compute_fiq_val_metrics
 def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                       num_epochs: int, blip_model_name: str, backbone: str, learning_rate: float, batch_size: int,
                       validation_frequency: int, transform: str, save_training: bool, save_best: bool, save_memory: bool, 
+                      experiment_name: str = None,
                       **kwargs):
     """
     Fine-tune CLIP on the FashionIQ dataset using as combining function the image-text element-wise sum
@@ -40,12 +41,17 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     :param save_training: when True save the weights of the fine-tuned CLIP model
     :param encoder: which CLIP encoder to fine-tune, should be in ['both', 'text', 'image']
     :param save_best: when True save only the weights of the best CLIP model wrt the average_recall metric
+    :param experiment_name: name for this experiment (used in output filenames)
     :param kwargs: if you use the `targetpad` transform you should prove `target_ratio` as kwarg
     """
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    training_path: Path = Path(
-        base_path / f"models/clip_finetuned_on_fiq_{blip_model_name}_{training_start}")
+    if experiment_name:
+        training_path: Path = Path(
+            base_path / f"models/clip_finetuned_on_fiq_{blip_model_name}_{experiment_name}_{training_start}")
+    else:
+        training_path: Path = Path(
+            base_path / f"models/clip_finetuned_on_fiq_{blip_model_name}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
     print(f"save-memory-in: {save_memory}")
     # Save all the hyperparameters on a file
@@ -195,6 +201,7 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
 
 def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, learning_rate: float, batch_size: int,
                        validation_frequency: int, transform: str, save_training: bool, save_best: bool,
+                       experiment_name: str = None,
                        **kwargs):
     """
     Fine-tune CLIP on the CIRR dataset using as combining function the image-text element-wise sum
@@ -208,13 +215,18 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     :param save_training: when True save the weights of the Combiner network
     :param encoder: which CLIP encoder to fine-tune, should be in ['both', 'text', 'image']
     :param save_best: when True save only the weights of the best Combiner wrt three different averages of the metrics
+    :param experiment_name: name for this experiment (used in output filenames)
     :param kwargs: if you use the `targetpad` transform you should prove `target_ratio`    :return:
     """
     rtc_weights = kwargs['loss_rtc']
     align_weights = kwargs['loss_align']
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    training_path: Path = Path(
-        base_path / f"models/clip_finetuned_on_cirr_{blip_model_name}_{training_start}")
+    if experiment_name:
+        training_path: Path = Path(
+            base_path / f"models/clip_finetuned_on_cirr_{blip_model_name}_{experiment_name}_{training_start}")
+    else:
+        training_path: Path = Path(
+            base_path / f"models/clip_finetuned_on_cirr_{blip_model_name}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
 
     # Save all the hyperparameters on a file
@@ -389,6 +401,8 @@ if __name__ == '__main__':
                         help="Save only the best model during training")
     parser.add_argument("--save-memory", dest="save_memory", action='store_true',
                         help="Save only the best model during training")
+    parser.add_argument("--experiment-name", type=str, default=None,
+                        help="Name for this experiment (used in output filenames)")
 
     args = parser.parse_args()
     if args.dataset.lower() not in ['fashioniq', 'cirr']:
@@ -410,7 +424,8 @@ if __name__ == '__main__':
         "loss_rtc": args.loss_rtc,
         "loss_align": args.loss_align,
         "loss_itm": args.loss_itm,
-        "save_memory": args.save_memory
+        "save_memory": args.save_memory,
+        "experiment_name": args.experiment_name
     }
     # set_seed(912)
     if args.dataset.lower() == 'cirr':

@@ -1,0 +1,13 @@
+datasets/
+/models/
+simple_taxonomy/
+output/
+*.log
+submission/
+# Python cache
+**/__pycache__/
+'*.pyc'
+*.pyc
+*.pyo
+*.pyd
+
