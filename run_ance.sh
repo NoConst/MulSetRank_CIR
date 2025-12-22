@@ -4,16 +4,16 @@
 # Inspired by: Approximate Nearest Neighbor Negative Contrastive Learning for Dense Text Retrieval
 
 # Set CUDA device
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # Common parameters
 NUM_WORKERS=4
-BATCH_SIZE=128  # Smaller batch size due to additional memory for hard negatives
+BATCH_SIZE=32  # Smaller batch size due to additional memory for hard negatives
 LEARNING_RATE=1e-5
 NUM_EPOCHS=30
 
 # ANCE specific parameters
-ANCE_NUM_NEGATIVES=16       # Number of hard negatives per query
+ANCE_NUM_NEGATIVES=64       # Number of hard negatives per query
 ANCE_TOPK_CANDIDATES=100    # Top-k candidates to sample hard negatives from
 ANCE_REFRESH_INTERVAL=1     # Refresh ANN index every N epochs
 ANCE_WEIGHT=1.0             # Weight for hard negative samples
@@ -25,10 +25,11 @@ DATASET="FashionIQ"
 
 # Model configuration
 BLIP_MODEL_NAME="blip2_cir_align_prompt"
-BACKBONE="pretrain"  # pretrain for vit-g, pretrain_vitL for vit-l
+# BACKBONE="pretrain"  # pretrain for vit-g, pretrain_vitL for vit-l
+BACKBONE="pretrain_vitL"
 
 # Experiment name (for organizing output directories)
-EXPERIMENT_NAME="ance_exp_v1"
+EXPERIMENT_NAME="ance_exp_v1_${ANCE_NUM_NEGATIVES}_only_hard_neg"
 
 cd /root/siton-data-92a7d2fc7b594215b07e48fd8818598b/MulSetRank_CIR/src
 

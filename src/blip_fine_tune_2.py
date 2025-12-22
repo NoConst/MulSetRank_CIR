@@ -48,10 +48,10 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     if experiment_name:
         training_path: Path = Path(
-            base_path / f"models/clip_finetuned_on_fiq_{blip_model_name}_{experiment_name}_{training_start}")
+            base_path / f"models/fiq_{blip_model_name}_{experiment_name}_{training_start}")
     else:
         training_path: Path = Path(
-            base_path / f"models/clip_finetuned_on_fiq_{blip_model_name}_{training_start}")
+            base_path / f"models/fiq_{blip_model_name}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
     print(f"save-memory-in: {save_memory}")
     # Save all the hyperparameters on a file
@@ -116,7 +116,7 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     for epoch in range(num_epochs):
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
-        for idx, (reference_images, target_images, captions) in enumerate(train_bar):
+        for idx, (reference_images, target_images, captions, _) in enumerate(train_bar):
             images_in_batch = reference_images.size(0)
             step = len(train_bar) * epoch + idx
 
@@ -229,10 +229,10 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     if experiment_name:
         training_path: Path = Path(
-            base_path / f"models/clip_finetuned_on_cirr_{blip_model_name}_{experiment_name}_{training_start}")
+            base_path / f"models/cirr_{blip_model_name}_{experiment_name}_{training_start}")
     else:
         training_path: Path = Path(
-            base_path / f"models/clip_finetuned_on_cirr_{blip_model_name}_{training_start}")
+            base_path / f"models/cirr_{blip_model_name}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
 
     # Save all the hyperparameters on a file
@@ -296,7 +296,7 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     for epoch in range(num_epochs):
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
-        for idx, (reference_images, target_images, captions) in enumerate(train_bar):
+        for idx, (reference_images, target_images, captions, _) in enumerate(train_bar):
             # print(scheduler.optimizer.param_groups[0]['lr'])
             images_in_batch = reference_images.size(0)
             step = len(train_bar) * epoch + idx

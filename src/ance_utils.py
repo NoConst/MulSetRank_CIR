@@ -397,15 +397,19 @@ def compute_ance_loss(
     """
     Compute contrastive loss with hard negatives.
     
+    The loss consists of two parts:
+    1. In-batch contrastive loss: following BLIP2 style (fusion_feats vs all target_feats in batch)
+    2. Hard negative loss: positive vs hard negatives from FAISS index
+    
     Args:
         fusion_feats: Query features (batch_size, dim)
-        target_feats: Positive target features (batch_size, num_queries, dim)
+        target_feats: Positive target features (batch_size, num_queries, dim) or (batch_size, dim)
         hard_negative_feats: Hard negative features (batch_size, num_negatives, dim)
         temperature: Temperature scaling factor
-        hard_negative_weight: Weight for hard negative samples in loss
+        hard_negative_weight: Weight for hard negative loss (default 1.0)
         
     Returns:
-        Combined contrastive loss
+        Combined loss = inbatch_loss + hard_negative_weight * hard_negative_loss
     """
     batch_size = fusion_feats.size(0)
     device = fusion_feats.device
@@ -414,25 +418,50 @@ def compute_ance_loss(
     if fusion_feats.dim() == 1:
         fusion_feats = fusion_feats.unsqueeze(0)
     
-    # Handle target_feats: (B, Q, D) -> compute max similarity per sample
+    # ============ Part 1: In-batch contrastive loss (BLIP2 style) ============
+    # Reference: blip2_qformer_cir_align_prompt.py forward()
+    
     if target_feats.dim() == 3:
         # fusion_feats: (B, D), target_feats: (B, Q, D)
-        # Compute similarity: (B, D) x (B, D, Q) -> (B, Q), then take max
+        # Compute similarity: (B, 1, 1, D) x (B, D, Q) -> (B, B, Q)
+        sim_t2q = torch.matmul(
+            fusion_feats.unsqueeze(1).unsqueeze(1),  # (B, 1, 1, D)
+            target_feats.permute(0, 2, 1)  # (B, D, Q)
+        ).squeeze()  # (B, B, Q) or (B, Q) if B=1
+        
+        # Handle batch size = 1 case
+        if batch_size == 1:
+            sim_t2q = sim_t2q.unsqueeze(0)  # (1, 1, Q)
+        
+        # Take max over query tokens: (B, B, Q) -> (B, B)
+        sim_i2t, _ = sim_t2q.max(-1)
+    else:
+        # target_feats is already (B, D)
+        # Compute similarity matrix: (B, D) x (D, B) -> (B, B)
+        sim_i2t = torch.matmul(fusion_feats, target_feats.T)
+    
+    # Apply temperature
+    sim_i2t = sim_i2t / temperature
+    
+    # Labels: diagonal is positive, targets = [0, 1, 2, ..., B-1]
+    targets = torch.arange(batch_size, dtype=torch.long, device=device)
+    
+    # In-batch contrastive loss
+    loss_inbatch = torch.nn.functional.cross_entropy(sim_i2t, targets)
+    
+    # ============ Part 2: Hard negative contrastive loss ============
+    # Compute positive similarity for each sample
+    if target_feats.dim() == 3:
+        # fusion_feats: (B, D), target_feats: (B, Q, D)
+        # Get each sample's positive similarity: (B, 1, D) x (B, D, Q) -> (B, Q) -> max -> (B,)
         sim_pos = torch.bmm(
             fusion_feats.unsqueeze(1),  # (B, 1, D)
             target_feats.permute(0, 2, 1)  # (B, D, Q)
         ).squeeze(1)  # (B, Q)
         sim_pos, _ = sim_pos.max(dim=-1)  # (B,)
-        
-        # For in-batch negatives, use mean-pooled target features
-        target_feats_mean = target_feats.mean(dim=1)  # (B, D)
     else:
-        # target_feats is already (B, D)
+        # target_feats is (B, D), element-wise dot product for each pair
         sim_pos = (fusion_feats * target_feats).sum(dim=-1)  # (B,)
-        target_feats_mean = target_feats
-    
-    # Compute similarity with in-batch negatives
-    sim_inbatch = torch.matmul(fusion_feats, target_feats_mean.T)  # (B, B)
     
     # Compute similarity with hard negatives
     # hard_negative_feats: (B, N, D) or (B, D)
@@ -449,24 +478,21 @@ def compute_ance_loss(
     if sim_hard.dim() == 1:
         sim_hard = sim_hard.unsqueeze(1)
     
-    # Mask for in-batch negatives (exclude diagonal which is the positive)
-    mask = torch.ones_like(sim_inbatch, dtype=torch.bool)
-    mask.fill_diagonal_(False)
-    
-    # Gather in-batch negatives
-    inbatch_negatives = sim_inbatch[mask].view(batch_size, batch_size - 1)  # (B, B-1)
-    
-    # Concatenate all logits: [positive, in-batch negatives, hard negatives]
-    logits = torch.cat([
-        sim_pos.unsqueeze(1),  # (B, 1)
-        inbatch_negatives,  # (B, B-1)
-        sim_hard * hard_negative_weight  # (B, N)
+    # Logits for hard negative loss: [positive, hard_negatives]
+    logits_hard = torch.cat([
+        sim_pos.unsqueeze(1),  # (B, 1) - positive at index 0
+        sim_hard  # (B, N) - hard negatives
     ], dim=1) / temperature
     
     # Labels: positive is at index 0
-    labels = torch.zeros(batch_size, dtype=torch.long, device=device)
+    labels_hard = torch.zeros(batch_size, dtype=torch.long, device=device)
     
-    loss = torch.nn.functional.cross_entropy(logits, labels)
+    # Hard negative contrastive loss
+    loss_hard = torch.nn.functional.cross_entropy(logits_hard, labels_hard)
     
-    return loss
+    # ============ Combined loss ============
+    total_loss = loss_inbatch + hard_negative_weight * loss_hard
+    
+    # return total_loss
+    return hard_negative_weight * loss_hard
 

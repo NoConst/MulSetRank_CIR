@@ -173,7 +173,7 @@ class FashionIQDataset(Dataset):
                     target_name = self.triplets[index]['target']
                     target_image_path = dataset_path / 'fashionIQ_dataset' / 'images' / f"{target_name}.png"
                     target_image = self.preprocess(PIL.Image.open(target_image_path))
-                    return reference_image, target_image, image_captions
+                    return reference_image, target_image, image_captions, target_name
 
                 elif self.split == 'val':
                     target_name = self.triplets[index]['target']
@@ -258,7 +258,7 @@ class CIRRDataset(Dataset):
                     target_hard_name = self.triplets[index]['target_hard']
                     target_image_path = dataset_path / 'cirr_dataset' / 'CIRR' / self.name_to_relpath[target_hard_name]
                     target_image = self.preprocess(PIL.Image.open(target_image_path))
-                    return reference_image, target_image, rel_caption
+                    return reference_image, target_image, rel_caption, target_hard_name
 
                 elif self.split == 'val':
                     target_hard_name = self.triplets[index]['target_hard']

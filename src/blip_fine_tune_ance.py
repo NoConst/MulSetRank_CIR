@@ -318,7 +318,7 @@ def clip_finetune_fiq_ance(
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
         
-        for idx, (reference_images, target_images, captions) in enumerate(train_bar):
+        for idx, (reference_images, target_images, captions, target_names) in enumerate(train_bar):
             images_in_batch = reference_images.size(0)
             optimizer.zero_grad()
 
@@ -367,11 +367,10 @@ def clip_finetune_fiq_ance(
                         blip_model.text_proj(text_output.last_hidden_state[:, 32, :]), dim=-1
                     )
                     
-                    # We don't have target names in training, use dummy names
-                    dummy_target_names = [f"dummy_{i}" for i in range(images_in_batch)]
+                    # Use real target names to correctly exclude positives from hard negatives
                     _, hard_negative_features = hard_negative_miner.mine_hard_negatives(
                         query_features=query_features,
-                        positive_names=dummy_target_names
+                        positive_names=list(target_names)
                     )
                 blip_model.train()
 
@@ -591,7 +590,7 @@ def clip_finetune_cirr_ance(
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
         
-        for idx, (reference_images, target_images, captions) in enumerate(train_bar):
+        for idx, (reference_images, target_images, captions, target_names) in enumerate(train_bar):
             images_in_batch = reference_images.size(0)
             optimizer.zero_grad()
 
@@ -635,10 +634,10 @@ def clip_finetune_cirr_ance(
                         blip_model.text_proj(text_output.last_hidden_state[:, 32, :]), dim=-1
                     )
                     
-                    dummy_target_names = [f"dummy_{i}" for i in range(images_in_batch)]
+                    # Use real target names to correctly exclude positives from hard negatives
                     _, hard_negative_features = hard_negative_miner.mine_hard_negatives(
                         query_features=query_features,
-                        positive_names=dummy_target_names
+                        positive_names=list(target_names)
                     )
                 blip_model.train()
 
