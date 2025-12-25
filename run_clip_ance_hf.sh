@@ -4,10 +4,11 @@
 # This script trains CLIP models with ANCE (hard negative mining) for CIR tasks
 
 # Set CUDA device
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 
 # ===== Configuration =====
 DATASET="fashionIQ"  # or "CIRR"
+# DATASET="CIRR"
 
 # Hugging Face CLIP Model Options:
 # - "ViT-B/32" (maps to openai/clip-vit-base-patch32)
@@ -16,18 +17,18 @@ DATASET="fashionIQ"  # or "CIRR"
 # - Or use direct HF model path: "openai/clip-vit-base-patch32"
 
 CLIP_MODEL="ViT-B/32"  # Default: ViT-B/32
-EXPERIMENT_NAME="clip_ance_hf_v1"
+EXPERIMENT_NAME="clip_ance_hf_v1_high_low_binary_repeat"
 
 # Training hyperparameters
-NUM_EPOCHS=100
-BATCH_SIZE=128
+NUM_EPOCHS=30
+BATCH_SIZE=32
 LEARNING_RATE=2e-6
 NUM_WORKERS=4
 VALIDATION_FREQ=1
 
 # ANCE specific parameters
 ANCE_NUM_NEGATIVES=16        # Number of hard negatives per query
-ANCE_TOPK_CANDIDATES=100     # Top-k candidates from ANN search
+ANCE_TOPK_CANDIDATES=100    # Top-k candidates from ANN search
 ANCE_REFRESH_INTERVAL=1      # Refresh FAISS index every N epochs
 ANCE_WEIGHT=1.0              # Weight for hard negative loss
 ANCE_WARMUP_EPOCHS=0         # Train N epochs without ANCE first

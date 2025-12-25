@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from typing import Union, List, Dict, Literal
+from concurrent.futures import ThreadPoolExecutor
 
 import PIL
 import PIL.Image
@@ -121,7 +122,7 @@ class FashionIQDataset(Dataset):
     The dataset manage an arbitrary numbers of FashionIQ category, e.g. only dress, dress+toptee+shirt, dress+shirt...
     """
 
-    def __init__(self, split: str, dress_types: List[str], mode: str, preprocess: callable):
+    def __init__(self, split: str, dress_types: List[str], mode: str, preprocess: callable, preload_images: bool = False):
         """
         :param split: dataset split, should be in ['test', 'train', 'val']
         :param dress_types: list of fashionIQ category
@@ -132,10 +133,13 @@ class FashionIQDataset(Dataset):
                 - (reference_name, target_name, image_captions) when split == val
                 - (reference_name, reference_image, image_captions) when split == test
         :param preprocess: function which preprocesses the image
+        :param preload_images: if True, preload all images into memory for faster access
         """
         self.mode = mode
         self.dress_types = dress_types
         self.split = split
+        self.preload_images = preload_images
+        self.image_cache = {}  # Cache for preloaded images
 
         if mode not in ['relative', 'classic']:
             raise ValueError("mode should be in ['relative', 'classic']")
@@ -160,6 +164,10 @@ class FashionIQDataset(Dataset):
                 self.image_names.extend(json.load(f))
 
         print(f"FashionIQ {split} - {dress_types} dataset in {mode} mode initialized")
+        
+        # Preload all images into memory if requested
+        if self.preload_images and self.mode == 'classic':
+            self._preload_all_images()
 
     def __getitem__(self, index):
         try:
@@ -202,6 +210,74 @@ class FashionIQDataset(Dataset):
             return len(self.image_names)
         else:
             raise ValueError("mode should be in ['relative', 'classic']")
+    
+    def get_image_by_name(self, image_name: str):
+        """
+        Load and preprocess an image by its name.
+        Used for loading hard negative samples during training.
+        
+        Args:
+            image_name: Name of the image (without extension)
+            
+        Returns:
+            Preprocessed image tensor
+        """
+        # Check cache first
+        if image_name in self.image_cache:
+            return self.image_cache[image_name]
+        
+        # Load from disk if not in cache
+        image_path = dataset_path / 'fashionIQ_dataset' / 'images' / f"{image_name}.png"
+        image = self.preprocess(PIL.Image.open(image_path))
+        return image
+    
+    def _preload_all_images(self):
+        """
+        Preload all images into memory for faster access during training.
+        This is useful when doing hard negative mining which requires frequent random access.
+        """
+        print(f"🔄 Preloading {len(self.image_names)} images into memory...")
+        from tqdm import tqdm
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def load_single_image(image_name):
+            image_path = dataset_path / 'fashionIQ_dataset' / 'images' / f"{image_name}.png"
+            image = self.preprocess(PIL.Image.open(image_path))
+            return image_name, image
+        
+        # Use parallel loading for speed
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            results = list(tqdm(
+                executor.map(load_single_image, self.image_names),
+                total=len(self.image_names),
+                desc="Loading images"
+            ))
+        
+        # Store in cache
+        self.image_cache = dict(results)
+        print(f"✅ Successfully preloaded {len(self.image_cache)} images into memory")
+    
+    def get_images_by_names(self, image_names: List[str], use_parallel: bool = True, num_workers: int = 4):
+        """
+        Batch load and preprocess multiple images by their names (optimized).
+        
+        Args:
+            image_names: List of image names (without extension)
+            use_parallel: Whether to use parallel loading (faster for many images)
+            num_workers: Number of parallel workers
+            
+        Returns:
+            Stacked tensor of preprocessed images [N, C, H, W]
+        """
+        if not use_parallel or len(image_names) < 4:
+            # Sequential loading for small batches
+            images = [self.get_image_by_name(name) for name in image_names]
+        else:
+            # Parallel loading for large batches
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                images = list(executor.map(self.get_image_by_name, image_names))
+        
+        return torch.stack(images)
 
 
 class CIRRDataset(Dataset):
@@ -215,7 +291,7 @@ class CIRRDataset(Dataset):
                 - (pair_id, reference_name, rel_caption, group_members) when split == test1
     """
 
-    def __init__(self, split: str, mode: str, preprocess: callable):
+    def __init__(self, split: str, mode: str, preprocess: callable, preload_images: bool = False):
         """
         :param split: dataset split, should be in ['test', 'train', 'val']
         :param mode: dataset mode, should be in ['relative', 'classic']:
@@ -225,10 +301,13 @@ class CIRRDataset(Dataset):
                         - (reference_name, target_name, rel_caption, group_members) when split == val
                         - (pair_id, reference_name, rel_caption, group_members) when split == test1
         :param preprocess: function which preprocesses the image
+        :param preload_images: if True, preload all images into memory for faster access
         """
         self.preprocess = preprocess
         self.mode = mode
         self.split = split
+        self.preload_images = preload_images
+        self.image_cache = {}  # Cache for preloaded images
 
         if split not in ['test1', 'train', 'val']:
             raise ValueError("split should be in ['test1', 'train', 'val']")
@@ -244,6 +323,10 @@ class CIRRDataset(Dataset):
             self.name_to_relpath = json.load(f)
 
         print(f"CIRR {split} dataset in {mode} mode initialized")
+        
+        # Preload all images into memory if requested
+        if self.preload_images and self.mode == 'classic':
+            self._preload_all_images()
 
     def __getitem__(self, index):
         try:
@@ -288,6 +371,77 @@ class CIRRDataset(Dataset):
             return len(self.name_to_relpath)
         else:
             raise ValueError("mode should be in ['relative', 'classic']")
+    
+    def get_image_by_name(self, image_name: str):
+        """
+        Load and preprocess an image by its name.
+        Used for loading hard negative samples during training.
+        
+        Args:
+            image_name: Name of the image
+            
+        Returns:
+            Preprocessed image tensor
+        """
+        # Check cache first
+        if image_name in self.image_cache:
+            return self.image_cache[image_name]
+        
+        # Load from disk if not in cache
+        if image_name not in self.name_to_relpath:
+            raise ValueError(f"Image name {image_name} not found in dataset")
+        image_path = dataset_path / 'cirr_dataset' / 'CIRR' / self.name_to_relpath[image_name]
+        image = self.preprocess(PIL.Image.open(image_path))
+        return image
+    
+    def _preload_all_images(self):
+        """
+        Preload all images into memory for faster access during training.
+        This is useful when doing hard negative mining which requires frequent random access.
+        """
+        print(f"🔄 Preloading {len(self.name_to_relpath)} images into memory...")
+        from tqdm import tqdm
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def load_single_image(image_name):
+            image_path = dataset_path / 'cirr_dataset' / 'CIRR' / self.name_to_relpath[image_name]
+            image = self.preprocess(PIL.Image.open(image_path))
+            return image_name, image
+        
+        # Use parallel loading for speed
+        image_names = list(self.name_to_relpath.keys())
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            results = list(tqdm(
+                executor.map(load_single_image, image_names),
+                total=len(image_names),
+                desc="Loading images"
+            ))
+        
+        # Store in cache
+        self.image_cache = dict(results)
+        print(f"✅ Successfully preloaded {len(self.image_cache)} images into memory")
+    
+    def get_images_by_names(self, image_names: List[str], use_parallel: bool = True, num_workers: int = 4):
+        """
+        Batch load and preprocess multiple images by their names (optimized).
+        
+        Args:
+            image_names: List of image names
+            use_parallel: Whether to use parallel loading (faster for many images)
+            num_workers: Number of parallel workers
+            
+        Returns:
+            Stacked tensor of preprocessed images [N, C, H, W]
+        """
+        if not use_parallel or len(image_names) < 4:
+            # Sequential loading for small batches
+            images = [self.get_image_by_name(name) for name in image_names]
+        else:
+            # Parallel loading for large batches
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                images = list(executor.map(self.get_image_by_name, image_names))
+        
+        return torch.stack(images)
 
 
 class CIRCODataset(Dataset):

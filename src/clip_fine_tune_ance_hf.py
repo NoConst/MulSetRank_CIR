@@ -25,6 +25,7 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import OneCycleLR
 import os
 import logging
+import time
 
 # Hugging Face Transformers
 from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
@@ -366,12 +367,17 @@ def clip_finetune_fiq_ance(
         classic_val_datasets.append(FashionIQDataset('val', [dress_type], 'classic', preprocess))
     
     relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', preprocess)
-    classic_train_dataset = FashionIQDataset('train', train_dress_types, 'classic', preprocess)
+    classic_train_dataset = FashionIQDataset('train', train_dress_types, 'classic', preprocess, preload_images=True)  # 预加载所有图像
     
     relative_train_loader = DataLoader(
         dataset=relative_train_dataset, batch_size=batch_size,
-        num_workers=kwargs.get('num_workers', 4), pin_memory=False, collate_fn=collate_fn,
-        drop_last=True, shuffle=True
+        num_workers=kwargs.get('num_workers', 4), 
+        pin_memory=True,  # 启用pin_memory加速GPU传输
+        collate_fn=collate_fn,
+        drop_last=True, 
+        shuffle=True,
+        prefetch_factor=2,  # 预取2个batch
+        persistent_workers=True  # 保持worker进程，减少启动开销
     )
     
     # Initialize ANCE hard negative miner
@@ -380,7 +386,7 @@ def clip_finetune_fiq_ance(
         num_negatives=ance_num_negatives,
         topk_candidates=ance_topk_candidates,
         refresh_interval=ance_refresh_interval,
-        use_gpu=False,
+        use_gpu=False,  # CPU模式避免与PyTorch GPU冲突（FAISS在CPU也很快）
         cache_dir=str(training_path / "ance_cache")
     )
     
@@ -433,7 +439,7 @@ def clip_finetune_fiq_ance(
         
         for idx, (reference_images, target_images, captions, target_names) in enumerate(train_bar):
             images_in_batch = reference_images.size(0)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # Faster than set_to_none=False
             
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
@@ -445,26 +451,7 @@ def clip_finetune_fiq_ance(
             
             clip_model.train()
             
-            # Get hard negatives if ANCE is enabled
-            hard_negative_features = None
-            if use_ance:
-                with torch.no_grad():
-                    clip_model.eval()
-                    ref_features = clip_model.get_image_features(pixel_values=reference_images)
-                    text_features = encode_text_hf(clip_model, tokenizer, captions, device)
-                    
-                    ref_features = F.normalize(ref_features, dim=-1)
-                    text_features = F.normalize(text_features, dim=-1)
-                    
-                    query_features = element_wise_sum(ref_features, text_features)
-                    
-                    _, hard_negative_features = hard_negative_miner.mine_hard_negatives(
-                        query_features=query_features,
-                        positive_names=list(target_names)
-                    )
-                clip_model.train()
-            
-            # Forward pass
+            # Forward pass - encode images and text ONCE (避免重复编码)
             with torch.cuda.amp.autocast():
                 # Encode images
                 ref_features = clip_model.get_image_features(pixel_values=reference_images)
@@ -481,14 +468,93 @@ def clip_finetune_fiq_ance(
                 # Compose query: element-wise sum
                 query_features = element_wise_sum(ref_features, text_features)
                 
-                # Compute loss
-                if use_ance and hard_negative_features is not None:
+                # Mine hard negatives using the already computed features (不再重复编码!)
+                hard_negative_names = None
+                ref_hard_negative_names = None
+                if use_ance:
+                    with torch.no_grad():
+                        # 1. 挖掘query的硬负样本（视觉+文本组合后相似的目标图像）
+                        _, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                            query_features=query_features.detach(),  # detach避免影响梯度
+                            positive_names=list(target_names),
+                            return_names=True
+                        )
+                        
+                        # 2. 挖掘reference image的硬负样本（视觉上相似但不匹配text的图像）
+                        # 使用reference_features而非query_features来挖掘
+                        _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                            query_features=ref_features.detach(),  # 使用reference image features
+                            positive_names=list(target_names),  # 排除正样本
+                            return_names=True
+                        )
+                
+                # Load and encode hard negatives (在autocast内，但在单独的section)
+                if use_ance and hard_negative_names is not None:
+                    # Flatten all negative sample names
+                    all_neg_names = [name for batch_names in hard_negative_names for name in batch_names]
+                    num_negatives = len(hard_negative_names[0])
+                    total_negs = len(all_neg_names)
+                    
+                    # 动态chunk size: 增大到512以充分利用GPU（可通过参数调整）
+                    chunk_size = min(512, total_negs)
+                    
+                    # 直接从缓存获取图像（已预加载到内存，无需并行加载）
+                    # 使用列表推导式快速获取，比get_images_by_names更快
+                    all_neg_images = torch.stack([
+                        classic_train_dataset.get_image_by_name(name) for name in all_neg_names
+                    ]).to(device, non_blocking=True)
+                    
+                    # Batch encode in chunks
+                    all_neg_features_list = []
+                    for i in range(0, total_negs, chunk_size):
+                        chunk_images = all_neg_images[i:i+chunk_size]
+                        chunk_features = clip_model.get_image_features(pixel_values=chunk_images)
+                        chunk_features = F.normalize(chunk_features, dim=-1)
+                        all_neg_features_list.append(chunk_features)
+                    
+                    # Concatenate and reshape
+                    all_neg_features = torch.cat(all_neg_features_list, dim=0)
+                    hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
+                    
+                    # Clean up
+                    del all_neg_images, all_neg_features_list, all_neg_features
+                    
+                    # 🆕 编码reference硬负样本
+                    ref_hard_negative_features = None
+                    if ref_hard_negative_names is not None:
+                        # Flatten reference negative names
+                        all_ref_neg_names = [name for batch_names in ref_hard_negative_names for name in batch_names]
+                        num_ref_negatives = len(ref_hard_negative_names[0])
+                        total_ref_negs = len(all_ref_neg_names)
+                        
+                        # 从缓存加载reference硬负样本图像
+                        all_ref_neg_images = torch.stack([
+                            classic_train_dataset.get_image_by_name(name) for name in all_ref_neg_names
+                        ]).to(device, non_blocking=True)
+                        
+                        # Batch encode in chunks
+                        all_ref_neg_features_list = []
+                        for i in range(0, total_ref_negs, chunk_size):
+                            chunk_images = all_ref_neg_images[i:i+chunk_size]
+                            chunk_features = clip_model.get_image_features(pixel_values=chunk_images)
+                            chunk_features = F.normalize(chunk_features, dim=-1)
+                            all_ref_neg_features_list.append(chunk_features)
+                        
+                        # Concatenate and reshape
+                        all_ref_neg_features = torch.cat(all_ref_neg_features_list, dim=0)
+                        ref_hard_negative_features = all_ref_neg_features.view(images_in_batch, num_ref_negatives, -1)
+                        
+                        # Clean up
+                        del all_ref_neg_images, all_ref_neg_features_list, all_ref_neg_features
+                    
                     loss = compute_clip_ance_loss(
                         query_features=query_features,
                         target_features=target_features,
                         hard_negative_features=hard_negative_features,
                         temperature=0.07,
-                        hard_negative_weight=ance_weight
+                        hard_negative_weight=ance_weight,
+                        ref_hard_negative_features=ref_hard_negative_features,  # 🆕 传入reference硬负样本
+                        ref_hard_negative_weight=kwargs.get('ref_ance_weight', 0.5)  # 🆕 可配置权重
                     )
                 else:
                     # Standard in-batch contrastive loss
@@ -621,12 +687,17 @@ def clip_finetune_cirr_ance(
     relative_val_dataset = CIRRDataset('val', 'relative', preprocess)
     classic_val_dataset = CIRRDataset('val', 'classic', preprocess)
     relative_train_dataset = CIRRDataset('train', 'relative', preprocess)
-    classic_train_dataset = CIRRDataset('train', 'classic', preprocess)
+    classic_train_dataset = CIRRDataset('train', 'classic', preprocess, preload_images=True)  # 预加载所有图像
     
     relative_train_loader = DataLoader(
         dataset=relative_train_dataset, batch_size=batch_size,
-        num_workers=kwargs.get('num_workers', 4), pin_memory=False, collate_fn=collate_fn,
-        drop_last=True, shuffle=True
+        num_workers=kwargs.get('num_workers', 4), 
+        pin_memory=True,  # 启用pin_memory加速GPU传输
+        collate_fn=collate_fn,
+        drop_last=True, 
+        shuffle=True,
+        prefetch_factor=2,  # 预取2个batch
+        persistent_workers=True  # 保持worker进程，减少启动开销
     )
     
     # Initialize ANCE hard negative miner
@@ -635,7 +706,7 @@ def clip_finetune_cirr_ance(
         num_negatives=ance_num_negatives,
         topk_candidates=ance_topk_candidates,
         refresh_interval=ance_refresh_interval,
-        use_gpu=False,
+        use_gpu=False,  # CPU模式避免与PyTorch GPU冲突（FAISS在CPU也很快）
         cache_dir=str(training_path / "ance_cache")
     )
     
@@ -690,33 +761,14 @@ def clip_finetune_cirr_ance(
         
         for idx, (reference_images, target_images, captions, target_names) in enumerate(train_bar):
             images_in_batch = reference_images.size(0)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # Faster than set_to_none=False
             
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
             
             clip_model.train()
             
-            # Get hard negatives if ANCE is enabled
-            hard_negative_features = None
-            if use_ance:
-                with torch.no_grad():
-                    clip_model.eval()
-                    ref_features = clip_model.get_image_features(pixel_values=reference_images)
-                    text_features = encode_text_hf(clip_model, tokenizer, captions, device)
-                    
-                    ref_features = F.normalize(ref_features, dim=-1)
-                    text_features = F.normalize(text_features, dim=-1)
-                    
-                    query_features = element_wise_sum(ref_features, text_features)
-                    
-                    _, hard_negative_features = hard_negative_miner.mine_hard_negatives(
-                        query_features=query_features,
-                        positive_names=list(target_names)
-                    )
-                clip_model.train()
-            
-            # Forward pass
+            # Forward pass - encode images and text ONCE (避免重复编码)
             with torch.cuda.amp.autocast():
                 ref_features = clip_model.get_image_features(pixel_values=reference_images)
                 target_features = clip_model.get_image_features(pixel_values=target_images)
@@ -729,13 +781,91 @@ def clip_finetune_cirr_ance(
                 
                 query_features = element_wise_sum(ref_features, text_features)
                 
-                if use_ance and hard_negative_features is not None:
+                # Mine hard negatives using the already computed features (不再重复编码!)
+                hard_negative_names = None
+                ref_hard_negative_names = None
+                if use_ance:
+                    with torch.no_grad():
+                        # 1. 挖掘query的硬负样本
+                        _, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                            query_features=query_features.detach(),  # detach避免影响梯度
+                            positive_names=list(target_names),
+                            return_names=True
+                        )
+                        
+                        # 2. 挖掘reference image的硬负样本
+                        _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                            query_features=ref_features.detach(),  # 使用reference image features
+                            positive_names=list(target_names),
+                            return_names=True
+                        )
+                
+                # Load and encode hard negatives
+                if use_ance and hard_negative_names is not None:
+                    # Flatten all negative sample names
+                    all_neg_names = [name for batch_names in hard_negative_names for name in batch_names]
+                    num_negatives = len(hard_negative_names[0])
+                    total_negs = len(all_neg_names)
+                    
+                    # 动态chunk size: 增大到512以充分利用GPU
+                    chunk_size = min(512, total_negs)
+                    
+                    # 直接从缓存获取图像（已预加载到内存，无需并行加载）
+                    all_neg_images = torch.stack([
+                        classic_train_dataset.get_image_by_name(name) for name in all_neg_names
+                    ]).to(device, non_blocking=True)
+                    
+                    # Batch encode in chunks
+                    all_neg_features_list = []
+                    for i in range(0, total_negs, chunk_size):
+                        chunk_images = all_neg_images[i:i+chunk_size]
+                        chunk_features = clip_model.get_image_features(pixel_values=chunk_images)
+                        chunk_features = F.normalize(chunk_features, dim=-1)
+                        all_neg_features_list.append(chunk_features)
+                    
+                    # Concatenate and reshape
+                    all_neg_features = torch.cat(all_neg_features_list, dim=0)
+                    hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
+                    
+                    # Clean up
+                    del all_neg_images, all_neg_features_list, all_neg_features
+                    
+                    # 🆕 编码reference硬负样本
+                    ref_hard_negative_features = None
+                    if ref_hard_negative_names is not None:
+                        # Flatten reference negative names
+                        all_ref_neg_names = [name for batch_names in ref_hard_negative_names for name in batch_names]
+                        num_ref_negatives = len(ref_hard_negative_names[0])
+                        total_ref_negs = len(all_ref_neg_names)
+                        
+                        # 从缓存加载reference硬负样本图像
+                        all_ref_neg_images = torch.stack([
+                            classic_train_dataset.get_image_by_name(name) for name in all_ref_neg_names
+                        ]).to(device, non_blocking=True)
+                        
+                        # Batch encode in chunks
+                        all_ref_neg_features_list = []
+                        for i in range(0, total_ref_negs, chunk_size):
+                            chunk_images = all_ref_neg_images[i:i+chunk_size]
+                            chunk_features = clip_model.get_image_features(pixel_values=chunk_images)
+                            chunk_features = F.normalize(chunk_features, dim=-1)
+                            all_ref_neg_features_list.append(chunk_features)
+                        
+                        # Concatenate and reshape
+                        all_ref_neg_features = torch.cat(all_ref_neg_features_list, dim=0)
+                        ref_hard_negative_features = all_ref_neg_features.view(images_in_batch, num_ref_negatives, -1)
+                        
+                        # Clean up
+                        del all_ref_neg_images, all_ref_neg_features_list, all_ref_neg_features
+                    
                     loss = compute_clip_ance_loss(
                         query_features=query_features,
                         target_features=target_features,
                         hard_negative_features=hard_negative_features,
                         temperature=0.07,
-                        hard_negative_weight=ance_weight
+                        hard_negative_weight=ance_weight,
+                        ref_hard_negative_features=ref_hard_negative_features,  # 🆕 传入reference硬负样本
+                        ref_hard_negative_weight=kwargs.get('ref_ance_weight', 0.5)  # 🆕 可配置权重
                     )
                 else:
                     sim_matrix = torch.matmul(query_features, target_features.T) / 0.07
@@ -806,10 +936,12 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # 注意：启用benchmark可提升性能，但会牺牲一定的可重复性
+    torch.backends.cudnn.deterministic = False  # 允许非确定性以提速
+    torch.backends.cudnn.benchmark = True  # 启用cudnn自动调优，显著加速
     os.environ["PYTHONHASHSEED"] = str(seed)
     print(f"Random seed set as {seed}")
+    print(f"⚠️  Note: cudnn.benchmark=True for speed, may have slight non-determinism")
 
 
 if __name__ == '__main__':
@@ -839,6 +971,8 @@ if __name__ == '__main__':
                         help="Weight for hard negative samples in loss")
     parser.add_argument("--ance-warmup-epochs", default=0, type=int,
                         help="Number of epochs to train without ANCE before enabling it")
+    parser.add_argument("--ref-ance-weight", default=0.5, type=float,
+                        help="Weight for reference image hard negative loss")
     
     args = parser.parse_args()
     
@@ -865,6 +999,7 @@ if __name__ == '__main__':
         "ance_refresh_interval": args.ance_refresh_interval,
         "ance_weight": args.ance_weight,
         "ance_warmup_epochs": args.ance_warmup_epochs,
+        "ref_ance_weight": args.ref_ance_weight,  # 🆕 添加reference硬负样本权重参数
     }
     
     if args.dataset.lower() == 'cirr':
