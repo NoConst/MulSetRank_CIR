@@ -7,13 +7,14 @@ This module provides hard negative mining capabilities for CLIP-based CIR models
 where the composed query is the element-wise sum of text and image features.
 
 Uses Hugging Face Transformers CLIP models.
+Pure PyTorch implementation without FAISS dependency.
+Optimized for minimal CPU usage with vectorized operations.
 """
 
 import os
 import torch
 import torch.nn.functional as F
 import numpy as np
-import faiss
 from typing import Tuple, List, Optional, Union
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -28,32 +29,19 @@ logger = logging.getLogger(__name__)
 class CLIPHardNegativeMiner:
     """
     ANCE-style hard negative miner for CLIP-based CIR models.
-    Uses FAISS for approximate nearest neighbor search.
-    
-    The target features are CLIP image embeddings, and queries are
-    element-wise sum of reference image and text embeddings.
+    Uses pure PyTorch for nearest neighbor search (no FAISS dependency).
+    Optimized for GPU with minimal CPU operations.
     """
     
     def __init__(
         self,
-        embedding_dim: int = 512,  # CLIP ViT-B/32 dim, adjust for other models
+        embedding_dim: int = 512,
         num_negatives: int = 16,
         topk_candidates: int = 100,
         refresh_interval: int = 1,
-        use_gpu: bool = False,
+        use_gpu: bool = True,
         cache_dir: Optional[str] = None
     ):
-        """
-        Initialize the CLIP hard negative miner.
-        
-        Args:
-            embedding_dim: Dimension of CLIP embeddings (512 for ViT-B/32, 768 for ViT-L/14)
-            num_negatives: Number of hard negatives to sample per query
-            topk_candidates: Top-k candidates from which to sample negatives
-            refresh_interval: How often to refresh the ANN index (in epochs)
-            use_gpu: Whether to use GPU for FAISS search
-            cache_dir: Directory to cache embeddings (optional)
-        """
         self.embedding_dim = embedding_dim
         self.num_negatives = num_negatives
         self.topk_candidates = topk_candidates
@@ -61,11 +49,13 @@ class CLIPHardNegativeMiner:
         self.use_gpu = use_gpu and torch.cuda.is_available()
         self.cache_dir = Path(cache_dir) if cache_dir else None
         
-        # Index and embeddings storage
-        self.index = None
-        self.target_embeddings = None
-        self.target_names = None
-        self.name_to_idx = {}
+        # Embeddings storage (PyTorch tensors on GPU)
+        self.target_embeddings: Optional[torch.Tensor] = None
+        self.target_names: Optional[List[str]] = None
+        self.name_to_idx: dict = {}
+        
+        # 🆕 预构建的索引tensor，用于快速查找
+        self._idx_tensor: Optional[torch.Tensor] = None
         
         # Training state
         self.last_refresh_epoch = -1
@@ -73,31 +63,6 @@ class CLIPHardNegativeMiner:
         
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    def _create_index(self, embeddings: np.ndarray) -> faiss.Index:
-        """Create a FAISS index for the embeddings using inner product (cosine similarity)."""
-        dim = embeddings.shape[1]
-        num_embeddings = embeddings.shape[0]
-        
-        logger.info(f"Creating FAISS index for {num_embeddings} embeddings with dim={dim}")
-        
-        # Use inner product for cosine similarity (embeddings should be normalized)
-        index = faiss.IndexFlatIP(dim)
-        
-        if self.use_gpu:
-            try:
-                res = faiss.StandardGpuResources()
-                res.setTempMemory(128 * 1024 * 1024)  # 128MB
-                index = faiss.index_cpu_to_gpu(res, 0, index)
-                logger.info("Using GPU for FAISS index")
-            except Exception as e:
-                logger.warning(f"Failed to use GPU for FAISS: {e}. Falling back to CPU.")
-                index = faiss.IndexFlatIP(dim)
-        
-        logger.info("Adding embeddings to FAISS index...")
-        index.add(embeddings)
-        logger.info(f"FAISS index built successfully with {index.ntotal} vectors")
-        return index
     
     @torch.no_grad()
     def build_index(
@@ -108,17 +73,8 @@ class CLIPHardNegativeMiner:
         batch_size: int = 64,
         num_workers: int = 4
     ):
-        """
-        Build the FAISS index from target image features using CLIP.
-        
-        Args:
-            clip_model: The CLIP model (transformers CLIPModel) for feature extraction
-            dataset: Dataset in 'classic' mode containing target images
-            device: torch device
-            batch_size: Batch size for feature extraction
-            num_workers: Number of data loading workers
-        """
-        logger.info("Building FAISS index for CLIP hard negative mining...")
+        """Build embedding index from target images."""
+        logger.info("Building PyTorch embedding index...")
         
         from utils import collate_fn
         
@@ -135,40 +91,45 @@ class CLIPHardNegativeMiner:
         all_features = []
         all_names = []
         
-        for names, images in tqdm(dataloader, desc="Extracting CLIP target features"):
+        for names, images in tqdm(dataloader, desc="Extracting features"):
             images = images.to(device, non_blocking=True)
-            
-            # Extract image features using transformers CLIP
-            # images are already preprocessed, so we pass them directly
-            outputs = clip_model.get_image_features(pixel_values=images)
-            image_features = outputs
-            
-            # Normalize features for cosine similarity
-            image_features = F.normalize(image_features, dim=-1)
-            
-            all_features.append(image_features.cpu().numpy())
+            with torch.cuda.amp.autocast():
+                # Support both HF CLIP (get_image_features) and LAVIS BLIP2 (extract_target_features)
+                if hasattr(clip_model, "get_image_features"):
+                    image_features = clip_model.get_image_features(pixel_values=images)
+                elif hasattr(clip_model, "extract_target_features"):
+                    # BLIP2 returns (features, aux); we only need the projected retrieval embedding
+                    image_features, _ = clip_model.extract_target_features(images, mode="mean")
+                else:
+                    raise AttributeError(
+                        "Unsupported model for CLIPHardNegativeMiner.build_index: "
+                        "expected `get_image_features` (CLIP) or `extract_target_features` (BLIP2)."
+                    )
+
+                # If token-level features are returned, pool to a single vector
+                if image_features.dim() == 3:
+                    image_features = image_features.mean(dim=1)
+
+                image_features = F.normalize(image_features, dim=-1)
+            all_features.append(image_features)
             all_names.extend(names)
-            
-            if len(all_features) % 100 == 0:
-                torch.cuda.empty_cache()
         
-        logger.info("Feature extraction completed. Concatenating features...")
+        self.target_embeddings = torch.cat(all_features, dim=0)
+        if not self.use_gpu:
+            self.target_embeddings = self.target_embeddings.cpu()
         
-        self.target_embeddings = np.vstack(all_features).astype('float32')
         self.target_names = all_names
         self.name_to_idx = {name: idx for idx, name in enumerate(all_names)}
         
-        logger.info(f"Total features shape: {self.target_embeddings.shape}")
+        # 🆕 预构建索引tensor
+        self._idx_tensor = torch.arange(len(all_names), device=self.target_embeddings.device)
+        
+        logger.info(f"Built index: {self.target_embeddings.shape}, on {'GPU' if self.target_embeddings.is_cuda else 'CPU'}")
         
         del all_features
         torch.cuda.empty_cache()
         
-        logger.info("Starting FAISS index construction...")
-        self.index = self._create_index(self.target_embeddings)
         self.is_initialized = True
-        
-        logger.info(f"Built index with {len(self.target_names)} target images")
-        
         return self.target_embeddings, self.target_names
     
     def refresh_index(
@@ -181,20 +142,109 @@ class CLIPHardNegativeMiner:
         num_workers: int = 4,
         force: bool = False
     ) -> bool:
-        """
-        Refresh the index if needed based on the refresh interval.
-        
-        Returns:
-            True if the index was refreshed, False otherwise
-        """
         should_refresh = force or (current_epoch - self.last_refresh_epoch >= self.refresh_interval)
-        
         if should_refresh:
             self.build_index(clip_model, dataset, device, batch_size, num_workers)
             self.last_refresh_epoch = current_epoch
             return True
-        
         return False
+    
+    def _search_topk(
+        self,
+        query_features: torch.Tensor,
+        k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """GPU-only top-k search."""
+        query_features = query_features.to(self.target_embeddings.device)
+        similarities = torch.matmul(query_features.float(), self.target_embeddings.T)
+        topk_sim, topk_idx = torch.topk(similarities, k=k, dim=-1, largest=True)
+        return topk_sim, topk_idx
+    
+    def _get_positive_indices_tensor(self, positive_names: List[str], device: torch.device) -> torch.Tensor:
+        """将positive_names转换为tensor indices（批量操作）"""
+        indices = torch.tensor(
+            [self.name_to_idx.get(name, -1) for name in positive_names],
+            dtype=torch.long,
+            device=device
+        )
+        return indices
+    
+    def mine_hard_negatives_vectorized(
+        self,
+        query_features: torch.Tensor,
+        positive_names: List[str],
+        exclude_reference_names: Optional[List[str]] = None
+    ) -> Tuple[torch.Tensor, List[List[str]]]:
+        """
+        向量化的硬负样本挖掘 - 最小化CPU操作
+        
+        Returns:
+            hard_negative_indices: [B, num_negatives] on GPU
+            hard_negative_names: List[List[str]]
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Index not initialized.")
+        
+        device = self.target_embeddings.device
+        query_features = F.normalize(query_features.to(device), dim=-1)
+        batch_size = query_features.shape[0]
+        
+        # 1. GPU上搜索top-k候选
+        _, topk_indices = self._search_topk(query_features, self.topk_candidates)
+        # topk_indices: [B, topk_candidates] on GPU
+        
+        # 2. 获取positive indices (GPU tensor)
+        positive_indices = self._get_positive_indices_tensor(positive_names, device)  # [B]
+        
+        # 3. 在GPU上创建mask排除正样本
+        # positive_indices: [B, 1], topk_indices: [B, topk_candidates]
+        positive_mask = (topk_indices == positive_indices.unsqueeze(1))  # [B, topk_candidates]
+        
+        # 4. 如果有exclude_reference_names，也排除
+        if exclude_reference_names:
+            exclude_indices = self._get_positive_indices_tensor(exclude_reference_names, device)
+            exclude_mask = (topk_indices == exclude_indices.unsqueeze(1))
+            positive_mask = positive_mask | exclude_mask
+        
+        # 5. 将正样本位置的值设为一个很大的负数（这样它们在排序后会排到最后）
+        # 使用similarity值来重新排序，但我们只需要indices
+        # 简单方法：直接过滤
+        
+        # 6. 向量化选择：使用masked_fill和gather
+        # 将要排除的位置填充为-1
+        filtered_indices = topk_indices.clone()
+        filtered_indices[positive_mask] = -1
+        
+        # 7. 对每个样本，选择前num_negatives个非-1的索引
+        # 由于topk已经按相似度排序，我们只需要取前面的非-1值
+        hard_negative_indices = torch.zeros(batch_size, self.num_negatives, dtype=torch.long, device=device)
+        
+        # 这里仍需要循环，但操作都在GPU tensor上，减少CPU开销
+        for i in range(batch_size):
+            valid_mask = filtered_indices[i] != -1
+            valid_indices = filtered_indices[i][valid_mask]
+            
+            if len(valid_indices) >= self.num_negatives:
+                hard_negative_indices[i] = valid_indices[:self.num_negatives]
+            else:
+                # 需要随机补充
+                hard_negative_indices[i, :len(valid_indices)] = valid_indices
+                # 随机采样补充（在GPU上）
+                n_needed = self.num_negatives - len(valid_indices)
+                random_indices = torch.randint(
+                    0, len(self.target_names), (n_needed,), 
+                    device=device, dtype=torch.long
+                )
+                hard_negative_indices[i, len(valid_indices):] = random_indices
+        
+        # 8. 转换为names（这步必须在CPU上，但indices已经准备好了）
+        indices_cpu = hard_negative_indices.cpu().numpy()
+        hard_negative_names = [
+            [self.target_names[idx] for idx in indices_cpu[i]]
+            for i in range(batch_size)
+        ]
+        
+        return hard_negative_indices, hard_negative_names
     
     def mine_hard_negatives(
         self,
@@ -202,96 +252,214 @@ class CLIPHardNegativeMiner:
         positive_names: List[str],
         exclude_reference_names: Optional[List[str]] = None,
         return_names: bool = True
-    ) -> Union[Tuple[np.ndarray, List[List[str]]], Tuple[np.ndarray, np.ndarray]]:
+    ) -> Union[Tuple[torch.Tensor, List[List[str]]], Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Mine hard negatives for a batch of composed queries.
-        
-        Args:
-            query_features: Composed query embeddings (batch_size, dim)
-                           This should be the element-wise sum of image and text features
-            positive_names: List of positive target names to exclude
-            exclude_reference_names: Additional names to exclude (e.g., reference images)
-            return_names: If True, return names; if False, return precomputed features
-            
-        Returns:
-            If return_names=True:
-                hard_negative_indices: Indices of hard negatives (batch_size, num_negatives)
-                hard_negative_names: Names of hard negatives (batch_size, num_negatives)
-            If return_names=False:
-                hard_negative_indices: Indices of hard negatives (batch_size, num_negatives)
-                hard_negative_features: Features of hard negatives (batch_size, num_negatives, dim)
+        Mine hard negatives - 使用向量化版本
         """
-        if not self.is_initialized:
-            raise RuntimeError("Index not initialized. Call build_index first.")
-        
-        # Normalize and convert to numpy
-        query_features = F.normalize(query_features, dim=-1)
-        query_np = query_features.cpu().numpy().astype('float32')
-        
-        batch_size = query_np.shape[0]
-        
-        # Search for top-k candidates
-        _, I = self.index.search(query_np, self.topk_candidates)
-        
-        # Filter out positives and sample hard negatives
-        hard_negative_indices = np.zeros((batch_size, self.num_negatives), dtype=np.int64)
-        
-        for i in range(batch_size):
-            candidates = I[i]
-            
-            # Get positive index to exclude
-            positive_idx = self.name_to_idx.get(positive_names[i], -1)
-            
-            # Get reference index to exclude (if provided)
-            exclude_idx = -1
-            if exclude_reference_names and i < len(exclude_reference_names):
-                exclude_idx = self.name_to_idx.get(exclude_reference_names[i], -1)
-            
-            # Filter candidates
-            valid_candidates = []
-            for cand in candidates:
-                if cand != positive_idx and cand != exclude_idx:
-                    valid_candidates.append(cand)
-                if len(valid_candidates) >= self.num_negatives:
-                    break
-            
-            # Pad if necessary
-            while len(valid_candidates) < self.num_negatives:
-                rand_idx = np.random.randint(0, len(self.target_names))
-                if rand_idx not in valid_candidates and rand_idx != positive_idx:
-                    valid_candidates.append(rand_idx)
-            
-            hard_negative_indices[i] = valid_candidates[:self.num_negatives]
+        indices, names = self.mine_hard_negatives_vectorized(
+            query_features, positive_names, exclude_reference_names
+        )
         
         if return_names:
-            # Return names instead of precomputed features for gradient flow
-            hard_negative_names = []
-            for i in range(batch_size):
-                batch_names = [self.target_names[idx] for idx in hard_negative_indices[i]]
-                hard_negative_names.append(batch_names)
-            return hard_negative_indices, hard_negative_names
+            return indices, names
         else:
-            # Return precomputed features (old behavior, breaks gradient)
-            hard_negative_features = self.target_embeddings[hard_negative_indices]
-            return hard_negative_indices, hard_negative_features
+            hard_negative_features = self.target_embeddings[indices]
+            return indices, hard_negative_features
     
-    def get_features_by_names(self, names: List[str]) -> np.ndarray:
+    def get_features_by_names(self, names: List[str]) -> torch.Tensor:
         """Get precomputed features for a list of image names."""
         indices = [self.name_to_idx[name] for name in names if name in self.name_to_idx]
         if not indices:
-            return np.array([])
+            return torch.tensor([])
         return self.target_embeddings[indices]
     
-    def get_features_by_indices(self, indices: Union[List[int], np.ndarray]) -> np.ndarray:
+    def get_features_by_indices(self, indices: Union[List[int], np.ndarray, torch.Tensor]) -> torch.Tensor:
         """Get precomputed features by indices."""
-        return self.target_embeddings[indices]
+        if isinstance(indices, np.ndarray):
+            indices = torch.from_numpy(indices).long()
+        elif isinstance(indices, list):
+            indices = torch.tensor(indices, dtype=torch.long)
+        return self.target_embeddings[indices.to(self.target_embeddings.device)]
+    
+    def mine_text_intent_negatives_vectorized(
+        self,
+        text_features: torch.Tensor,
+        ref_features: torch.Tensor,
+        captions: List[str],
+        positive_names: List[str],
+        hard_negative_indices: torch.Tensor,  # 🆕 直接接受indices而非names
+        num_negatives: int,
+        clip_model=None,
+        tokenizer=None
+    ) -> Tuple[torch.Tensor, List[List[str]]]:
+        """
+        向量化的text intent负样本挖掘
+        规则：用'and'来split caption，然后对于其中的每一部分描述，
+        与ref_features组合去检索一部分最近邻作为负样本，所有的构成最终的负样本
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Index not initialized.")
+        
+        if clip_model is None or tokenizer is None:
+            raise ValueError("clip_model and tokenizer are required for text intent negative mining.")
+        
+        device = self.target_embeddings.device
+        batch_size = text_features.shape[0]
+        
+        ref_features = F.normalize(ref_features.to(device), dim=-1)
+        
+        # 获取positive indices
+        positive_indices = self._get_positive_indices_tensor(positive_names, device)
+        
+        # 将hard_negative_indices移到正确设备
+        hard_negative_indices = hard_negative_indices.to(device)
+        
+        # 存储所有负样本indices
+        text_intent_negative_indices = torch.zeros(batch_size, num_negatives, dtype=torch.long, device=device)
+        
+        for i in range(batch_size):
+            # 用'and'分割caption
+            caption_parts = [part.strip() for part in captions[i].split('and') if part.strip()]
+            
+            if len(caption_parts) == 0:
+                # 如果没有分割出部分，使用原始caption
+                caption_parts = [captions[i]]
+            
+            # 计算每个部分应该分配的负样本数量
+            num_parts = len(caption_parts)
+            negatives_per_part = num_negatives // num_parts
+            remainder = num_negatives % num_parts
+            
+            all_negative_indices = []
+            
+            # 对每个部分进行编码和检索
+            for part_idx, part_text in enumerate(caption_parts):
+                # 编码这个部分的文本
+                with torch.no_grad():
+                    inputs = tokenizer(
+                        [part_text],
+                        padding=True,
+                        truncation=True,
+                        max_length=77,
+                        return_tensors="pt"
+                    ).to(device)
+                    # Use autocast for mixed precision compatibility with FSDP
+                    with torch.cuda.amp.autocast():
+                        part_text_features = clip_model.get_text_features(**inputs)
+                        part_text_features = F.normalize(part_text_features, dim=-1)
+                
+                # 与ref_features组合
+                part_query = F.normalize(ref_features[i:i+1] + part_text_features, dim=-1)
+                
+                # 搜索top-k候选
+                _, topk_indices = self._search_topk(part_query, self.topk_candidates)
+                topk_indices = topk_indices[0]  # [topk_candidates]
+                
+                # 创建排除mask：排除正样本和已有的hard negatives
+                positive_mask = (topk_indices == positive_indices[i])
+                
+                # 排除已有的hard negatives
+                for k in range(hard_negative_indices.shape[1]):
+                    positive_mask = positive_mask | (topk_indices == hard_negative_indices[i, k])
+                
+                # 过滤
+                filtered_indices = topk_indices.clone()
+                filtered_indices[positive_mask] = -1
+                
+                # 选择这个部分的负样本
+                valid_mask = filtered_indices != -1
+                valid_indices = filtered_indices[valid_mask]
+                
+                # 计算这个部分应该选择的负样本数量
+                part_num_negatives = negatives_per_part + (1 if part_idx < remainder else 0)
+                
+                if len(valid_indices) >= part_num_negatives:
+                    all_negative_indices.append(valid_indices[:part_num_negatives])
+                else:
+                    if len(valid_indices) > 0:
+                        all_negative_indices.append(valid_indices)
+                    # 如果不够，用随机样本补充
+                    n_needed = part_num_negatives - len(valid_indices)
+                    random_indices = torch.randint(
+                        0, len(self.target_names), (n_needed,),
+                        device=device, dtype=torch.long
+                    )
+                    all_negative_indices.append(random_indices)
+            
+            # 合并所有部分的负样本
+            if all_negative_indices:
+                combined_indices = torch.cat(all_negative_indices, dim=0)
+                # 确保总数不超过num_negatives
+                if len(combined_indices) > num_negatives:
+                    combined_indices = combined_indices[:num_negatives]
+                elif len(combined_indices) < num_negatives:
+                    # 如果不够，用随机样本补充
+                    n_needed = num_negatives - len(combined_indices)
+                    random_indices = torch.randint(
+                        0, len(self.target_names), (n_needed,),
+                        device=device, dtype=torch.long
+                    )
+                    combined_indices = torch.cat([combined_indices, random_indices], dim=0)
+                
+                text_intent_negative_indices[i] = combined_indices
+            else:
+                # 如果没有找到任何负样本，使用随机样本
+                random_indices = torch.randint(
+                    0, len(self.target_names), (num_negatives,),
+                    device=device, dtype=torch.long
+                )
+                text_intent_negative_indices[i] = random_indices
+        
+        # 转换为names
+        indices_cpu = text_intent_negative_indices.cpu().numpy()
+        text_intent_negative_names = [
+            [self.target_names[idx] for idx in indices_cpu[i]]
+            for i in range(batch_size)
+        ]
+        
+        return text_intent_negative_indices, text_intent_negative_names
+    
+    def mine_text_intent_negatives(
+        self,
+        text_features: torch.Tensor,
+        ref_features: torch.Tensor,
+        captions: List[str],
+        positive_names: List[str],
+        hard_negative_names: List[List[str]],
+        num_negatives: int,
+        return_names: bool = True,
+        hard_negative_indices: Optional[torch.Tensor] = None,  # 🆕 可选直接传入indices
+        clip_model=None,
+        tokenizer=None
+    ) -> Union[Tuple[torch.Tensor, List[List[str]]], Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Mine text intent-based negatives
+        """
+        device = self.target_embeddings.device
+        
+        # 如果没有传入indices，从names构建
+        if hard_negative_indices is None:
+            batch_size = len(hard_negative_names)
+            num_hard_neg = len(hard_negative_names[0])
+            hard_negative_indices = torch.zeros(batch_size, num_hard_neg, dtype=torch.long, device=device)
+            for i, names in enumerate(hard_negative_names):
+                for j, name in enumerate(names):
+                    hard_negative_indices[i, j] = self.name_to_idx.get(name, 0)
+        
+        indices, names = self.mine_text_intent_negatives_vectorized(
+            text_features, ref_features, captions, positive_names,
+            hard_negative_indices, num_negatives, clip_model, tokenizer
+        )
+        
+        if return_names:
+            return indices, names
+        else:
+            features = self.target_embeddings[indices]
+            return indices, features
+
 
 def contrastive_in_batch_loss(query, target, temperature=0.07, normalized=False):
-    """
-    query: [B, D]
-    target: [B, D]
-    normalized: If True, skip normalization (assume inputs are already normalized)
-    """
+    """In-batch contrastive loss."""
     if not normalized:
         query = F.normalize(query, dim=-1)
         target = F.normalize(target, dim=-1)
@@ -299,69 +467,110 @@ def contrastive_in_batch_loss(query, target, temperature=0.07, normalized=False)
     labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device)
     return F.cross_entropy(sim, labels)
 
+
 def contrastive_loss_hard_negative(query, positive, negatives, temperature=0.07, normalized=False):
-    """
-    query: [B, D]
-    positive: [B, D]
-    negatives: [B, K, D] (K 是负样本数量)
-    normalized: If True, skip normalization (assume inputs are already normalized)
-    """
-    # 1. 特征归一化 (L2 Normalization) - 使用余弦相似度时必须
+    """Contrastive loss with hard negatives."""
     if not normalized:
         query = F.normalize(query, dim=-1)
         positive = F.normalize(positive, dim=-1)
         negatives = F.normalize(negatives, dim=-1)
 
-    # 2. 计算正样本相似度: [B, 1]
-    # 使用 einsum 或 sum(q*p)
-    pos_sim = torch.sum(query * positive, dim=-1, keepdim=True) # [B, 1]
-
-    # 3. 计算负样本相似度: [B, K]
-    # query: [B, 1, D], negatives: [B, K, D] -> bmm -> [B, 1, K]
-    neg_sim = torch.bmm(query.unsqueeze(1), negatives.transpose(1, 2)).squeeze(1) # [B, K]
-
-    # 4. 拼接 logits: [B, K + 1]
-    # 约定第 0 列永远是正样本
-    logits = torch.cat([pos_sim, neg_sim], dim=1)
-    
-    # 5. 除以温度系数
-    logits /= temperature
-
-    # 6. 生成标签: 目标全为 0 (因为正样本在 index 0)
+    pos_sim = torch.sum(query * positive, dim=-1, keepdim=True)
+    neg_sim = torch.bmm(query.unsqueeze(1), negatives.transpose(1, 2)).squeeze(1)
+    logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature
     labels = torch.zeros(query.shape[0], dtype=torch.long, device=query.device)
+    return F.cross_entropy(logits, labels)
 
-    # 7. 计算交叉熵
-    loss = F.cross_entropy(logits, labels)
-    return loss
 
 def compute_local_ranking_loss(query_feat, target_feat, hard_neg_feats, margin=0.05):
-    """
-    计算局部相对边际损失，确保正样本相似度高于硬负样本（False Negatives）
-    
-    Args:
-        query_feat: [B, D] - 组合查询特征
-        target_feat: [B, D] - 标注的正样本图像特征
-        hard_neg_feats: [B, K, D] - 疑似假负样本的硬负样本张量
-        margin: 边际值，建议取值 0.01 ~ 0.05 之间以保护特征空间
-    """
-    # 1. L2 归一化：保证在超球面上进行微调，不破坏原始特征分布
+    """Local ranking loss."""
     query_feat = F.normalize(query_feat, dim=-1)
     target_feat = F.normalize(target_feat, dim=-1)
     hard_neg_feats = F.normalize(hard_neg_feats, dim=-1)
 
-    # 2. 计算正样本相似度 s(q, p): [B, 1]
     pos_sim = torch.sum(query_feat * target_feat, dim=-1, keepdim=True)
-
-    # 3. 计算负样本相似度 s(q, n): [B, K]
-    # 使用 bmm 计算 batch 内的矩阵乘法: (B, 1, D) * (B, D, K) -> (B, 1, K)
     neg_sims = torch.bmm(query_feat.unsqueeze(1), hard_neg_feats.transpose(1, 2)).squeeze(1)
-
-    # 4. 计算 Ranking Loss: max(0, neg_sim - pos_sim + margin)
-    # 只有当 neg_sim + margin > pos_sim 时才产生梯度，不会过度推开负样本
     loss = torch.clamp(neg_sims - pos_sim + margin, min=0.0)
-
-    # 返回 Batch 的平均损失
     return loss.mean()
+
+
+def compute_listwise_ranking_loss(
+    query_features: torch.Tensor,
+    negative_features_list: List[torch.Tensor],
+    temperature: float = 0.1,
+    ranking_weights: Optional[List[float]] = None
+) -> torch.Tensor:
+    """
+    使用 Listwise 排序来形成负样本之间的偏序
+    
+    Args:
+        query_features: [B, D] query features
+        negative_features_list: List of negative feature tensors, each [B, N_i, D]
+                                按照期望的排序顺序排列（例如：[hard, text_intent, ref_hard]）
+        temperature: temperature for softmax
+        ranking_weights: Optional weights for each negative type, default is [1.0, 0.8, 0.6, ...]
+    
+    Returns:
+        listwise ranking loss
+    """
+    device = query_features.device
+    batch_size = query_features.shape[0]
+    
+    # 归一化
+    query_features = F.normalize(query_features, dim=-1)
+    normalized_negatives = [F.normalize(neg, dim=-1) for neg in negative_features_list]
+    
+    # 计算每个负样本与query的相似度
+    all_similarities = []
+    
+    for neg_features in normalized_negatives:
+        # neg_features: [B, N_i, D]
+        # 计算相似度: [B, 1, D] x [B, D, N_i] -> [B, 1, N_i] -> [B, N_i]
+        sim = torch.bmm(
+            query_features.unsqueeze(1),
+            neg_features.transpose(1, 2)
+        ).squeeze(1)  # [B, N_i]
+        
+        all_similarities.append(sim)
+    
+    # 拼接所有相似度: [B, total_negatives]
+    all_sim = torch.cat(all_similarities, dim=1)  # [B, total_negatives]
+    
+    # 使用 softmax 将相似度转换为概率分布 (ListNet approach)
+    # 相似度越高，排名应该越高，softmax 会放大较大的值，所以直接使用 sim
+    
+    # 使用温度缩放
+    logits = all_sim / temperature
+    
+    # 构建目标概率分布
+    # 目标：前面的负样本类型（hard）应该比后面的（text_intent, ref_hard）排名更高
+    # 使用指数衰减的权重来构建目标分布
+    if ranking_weights is None:
+        # 默认权重：每个类型的权重递减
+        num_types = len(negative_features_list)
+        ranking_weights = [1.0 / (i + 1) for i in range(num_types)]
+    
+    # 为每个负样本分配目标权重
+    target_weights = []
+    for neg_idx, neg_features in enumerate(normalized_negatives):
+        num_neg = neg_features.shape[1]
+        weight = ranking_weights[neg_idx]
+        target_weights.extend([weight] * num_neg)
+    
+    target_weights = torch.tensor(target_weights, device=device, dtype=torch.float32)
+    target_weights = target_weights.unsqueeze(0).expand(batch_size, -1)  # [B, total_negatives]
+    
+    # 归一化目标权重为概率分布
+    target_probs = target_weights / target_weights.sum(dim=1, keepdim=True)  # [B, total_negatives]
+    
+    # 计算 KL 散度损失 (ListNet loss)
+    # KL(P_target || P_pred) = sum(P_target * log(P_target / P_pred))
+    # 为了避免数值不稳定，使用 log_softmax
+    log_pred_probs = F.log_softmax(logits, dim=-1)
+    kl_loss = F.kl_div(log_pred_probs, target_probs, reduction='batchmean')
+    
+    return kl_loss
+
 
 def compute_clip_ance_loss(
     query_features: torch.Tensor,
@@ -370,172 +579,122 @@ def compute_clip_ance_loss(
     temperature: float = 0.07,
     hard_negative_weight: float = 1.0,
     ref_hard_negative_features: Optional[torch.Tensor] = None,
-    ref_hard_negative_weight: float = 1.0
+    ref_hard_negative_weight: float = 1.0,
+    text_intent_negative_features: Optional[torch.Tensor] = None,
+    text_intent_negative_weight: float = 0.75
 ) -> torch.Tensor:
-    """
-    Compute ANCE-style contrastive loss for CLIP CIR.
-    
-    The loss combines:
-    1. In-batch contrastive loss: query vs all targets in the batch
-    2. Hard negative loss: query vs hard negatives from the current model
-    3. (Optional) Reference hard negative loss: query vs reference image hard negatives
-    
-    Args:
-        query_features: Composed query features (batch_size, dim)
-                       Element-wise sum of reference image + text features
-        target_features: Positive target features (batch_size, dim)
-        hard_negative_features: Hard negative features (batch_size, num_negatives, dim)
-                               Now these are freshly encoded through current model with gradients
-        temperature: Temperature scaling factor
-        hard_negative_weight: Weight for hard negative loss
-        ref_hard_negative_features: Reference image hard negatives (batch_size, num_ref_negatives, dim)
-                                   Images similar to reference but don't match text description
-        ref_hard_negative_weight: Weight for reference hard negative loss
-        
-    Returns:
-        Combined contrastive loss
-    """
+    """Compute ANCE-style contrastive loss with three-level negatives."""
     device = query_features.device
     
-    # Convert hard negatives to tensor if needed (backwards compatibility)
-    # Now hard_negative_features should already be a tensor with gradients
     if isinstance(hard_negative_features, np.ndarray):
         hard_neg_tensor = torch.from_numpy(hard_negative_features).float().to(device)
     else:
         hard_neg_tensor = hard_negative_features
+
+    # ---- Device alignment (important for distributed training) ----
+    # Ensure ALL tensors are on the same device as query_features to avoid cuda:x vs cpu mismatches.
+    if isinstance(target_features, torch.Tensor) and target_features.device != device:
+        target_features = target_features.to(device, non_blocking=True)
+    if isinstance(hard_neg_tensor, torch.Tensor) and hard_neg_tensor.device != device:
+        hard_neg_tensor = hard_neg_tensor.to(device, non_blocking=True)
+    if ref_hard_negative_features is not None and isinstance(ref_hard_negative_features, torch.Tensor):
+        if ref_hard_negative_features.device != device:
+            ref_hard_negative_features = ref_hard_negative_features.to(device, non_blocking=True)
+    if text_intent_negative_features is not None and isinstance(text_intent_negative_features, torch.Tensor):
+        if text_intent_negative_features.device != device:
+            text_intent_negative_features = text_intent_negative_features.to(device, non_blocking=True)
     
-    # ✅ GPU优化：统一归一化一次（避免在每个loss函数中重复归一化）
+    # 统一归一化
     query_features = F.normalize(query_features, dim=-1)
-    target_features = F.normalize(target_features, dim=-1)
+    if target_features.dim() == 3:
+        # (B, Q, D) token/query-level target features (e.g., BLIP2)
+        target_features = F.normalize(target_features, dim=-1)
+    else:
+        # (B, D) vector target features (e.g., CLIP)
+        target_features = F.normalize(target_features, dim=-1)
     hard_neg_tensor = F.normalize(hard_neg_tensor, dim=-1)
     
-    # Compute in-batch contrastive loss (传入normalized=True避免重复归一化)
-    loss_in_batch = contrastive_in_batch_loss(
-        query_features, target_features, temperature, normalized=True
-    )
-        
-    # Compute local ranking loss with hard negatives
-    # This loss ensures positive samples are ranked higher than hard negatives
-    # loss_local_ranking = compute_local_ranking_loss(query_features, target_features, hard_neg_tensor, margin=0.0)
+    # In-batch loss
+    if target_features.dim() == 3:
+        # query: (B,D), target: (B,Q,D) -> sim matrix (B,B) using max over Q
+        sim = torch.einsum("id,jqd->ijq", query_features.float(), target_features.float()).max(dim=-1).values
+        sim = sim / temperature
+        labels = torch.arange(query_features.shape[0], dtype=torch.long, device=device)
+        loss_in_batch = F.cross_entropy(sim, labels)
+    else:
+        loss_in_batch = contrastive_in_batch_loss(
+            query_features, target_features, temperature, normalized=True
+        )
+    
+    # Hard negative loss
+    if target_features.dim() == 3:
+        # Positive similarity per sample: max over Q
+        sim_pos = torch.einsum("id,iqd->iq", query_features.float(), target_features.float()).max(dim=-1).values
+        # Neg similarities: (B,N)
+        sim_hard = torch.bmm(
+            query_features.float().unsqueeze(1),
+            hard_neg_tensor.float().transpose(1, 2),
+        ).squeeze(1)
+        logits = torch.cat([sim_pos.unsqueeze(1), sim_hard], dim=1) / temperature
+        labels_hard = torch.zeros(query_features.shape[0], dtype=torch.long, device=device)
+        loss_hard_negative = F.cross_entropy(logits, labels_hard)
+    else:
+        loss_hard_negative = contrastive_loss_hard_negative(
+            query_features, target_features, hard_neg_tensor, temperature, normalized=True
+        )
 
-    loss_hard_negative = contrastive_loss_hard_negative(
-        query_features, target_features, hard_neg_tensor, temperature, normalized=True
-    )
-
-    # ✅ 优化版本1：向量化循环（保持原始语义，减少Python循环开销）
-    # 注意：完全批量化会改变loss的语义（分母范围不同），所以保留循环但优化索引
     batch_size, num_negatives, dim = hard_neg_tensor.shape
+    query_repeated = query_features.unsqueeze(1).repeat(1, num_negatives, 1).view(-1, dim)
+    hard_neg_flat = hard_neg_tensor.view(-1, dim)
+    loss_hard_in_batch = contrastive_in_batch_loss(query_repeated, hard_neg_flat, temperature)
+
+    total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative + loss_hard_in_batch
+    # total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative
+    # total_loss = loss_in_batch + loss_hard_in_batch
     
-    # # 使用列表推导和torch.stack减少循环开销
-    # losses = []
-    # for k in range(num_negatives):
-    #     target_k = hard_neg_tensor[:, k, :]  # [B, D] - 直接索引，避免split和squeeze
-    #     loss_k = contrastive_in_batch_loss(
-    #         query_features, target_k, temperature, normalized=True  # 已归一化
-    #     )
-    #     losses.append(loss_k)
+    # Text intent negative loss
+    text_intent_neg_tensor = None
+    if text_intent_negative_features is not None:
+        text_intent_neg_tensor = F.normalize(text_intent_negative_features, dim=-1)
+        loss_text_intent = contrastive_loss_hard_negative(
+            query_features, target_features, text_intent_neg_tensor, temperature, normalized=True
+        )
+        total_loss = total_loss + text_intent_negative_weight * loss_text_intent
     
-    # # # 堆叠并求和（比累加更高效）
-    # loss_hard_in_batch = torch.stack(losses).sum()
-    
-    # 备注：如果想要更激进的优化（改变训练语义，增加负样本难度），可以使用：
-    # query_repeated = query_features.unsqueeze(1).repeat(1, num_negatives, 1).view(-1, dim)
-    # hard_neg_flat = hard_neg_tensor.view(-1, dim)
-    # loss_hard_in_batch = contrastive_in_batch_loss(query_repeated, hard_neg_flat, temperature)
-    # 但这会让训练更难（分母更大），可能影响收敛
-    
-    # Combined loss
-    # total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative + loss_hard_in_batch
-    total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative
-    
-    # 🆕 Add reference hard negative loss if provided
+    # Reference hard negative loss
+    ref_hard_neg_tensor = None
     if ref_hard_negative_features is not None:
-        # Normalize reference hard negatives
         ref_hard_neg_tensor = F.normalize(ref_hard_negative_features, dim=-1)
-        
-        # Compute contrastive loss: query vs reference hard negatives
-        # 这个loss让模型学习到：即使reference相似，如果不匹配text描述也不应该被检索
-        loss_ref_hard_negative = contrastive_loss_hard_negative(
-            query_features, target_features, ref_hard_neg_tensor, temperature, normalized=True
+    
+    # 使用 Listwise 排序来形成负样本之间的偏序
+    # 期望的排序：hard > text_intent > ref_hard
+    negative_features_list = []
+    if text_intent_neg_tensor is not None:
+        # 如果有 text_intent，则排序为：hard > text_intent > ref_hard
+        negative_features_list.append(hard_neg_tensor)  # 最高优先级
+        negative_features_list.append(text_intent_neg_tensor)  # 中等优先级
+        if ref_hard_neg_tensor is not None:
+            negative_features_list.append(ref_hard_neg_tensor)  # 最低优先级
+    elif ref_hard_neg_tensor is not None:
+        # 如果没有 text_intent，则排序为：hard > ref_hard
+        negative_features_list.append(hard_neg_tensor)
+        negative_features_list.append(ref_hard_neg_tensor)
+    
+    # 如果有多个负样本类型，使用 listwise 排序损失
+    if len(negative_features_list) > 1:
+        # 定义每个类型的权重（权重越高，排名越高）
+        ranking_weights = [1.0, 0.7, 0.4][:len(negative_features_list)]
+        listwise_loss = compute_listwise_ranking_loss(
+            query_features=query_features,
+            negative_features_list=negative_features_list,
+            temperature=0.1,
+            ranking_weights=ranking_weights
         )
-        # query_repeated = query_features.unsqueeze(1).repeat(1, num_negatives, 1).view(-1, dim)
-        # ref_hard_neg_flat = ref_hard_neg_tensor.view(-1, dim)
-        # loss_ref_hard_in_batch = contrastive_in_batch_loss(query_repeated, ref_hard_neg_flat, temperature)
-
-        # loss_between_hard_and_ref_hard = 0
-        # for k in range(hard_neg_tensor.shape[1]):
-        #     hard_neg_k = hard_neg_tensor[:, k, :]
-        #     loss_between_hard_and_ref_hard += contrastive_loss_hard_negative(
-        #         query_features, hard_neg_k, ref_hard_neg_tensor, temperature, normalized=True
-        #     )
-            
-        # total_loss = total_loss + ref_hard_negative_weight * loss_ref_hard_negative + loss_ref_hard_in_batch + loss_between_hard_and_ref_hard
-
-        # 🆕 负样本层次化: 让query硬负样本比reference硬负样本更接近query
-        # 使用Pairwise Sigmoid Ranking: 不受负样本数量影响，梯度smooth
-        # 
-        # 优势：
-        # 1. 每个pair独立建模，不受K_hard/K_ref数量比例影响
-        # 2. 使用sigmoid提供smooth梯度，训练更稳定
-        # 3. 概率化建模，loss范围[0,1]，易于调参
-        
-        # ⚡ 完全向量化计算（无Python循环）
-        # 计算query vs query硬负样本的相似度 [B, K_hard]
-        sim_query_hard = torch.bmm(
-            query_features.unsqueeze(1), 
-            hard_neg_tensor.transpose(1, 2)
-        ).squeeze(1)  # [B, K_hard]
-        
-        # 计算query vs reference硬负样本的相似度 [B, K_ref]
-        sim_query_ref_hard = torch.bmm(
-            query_features.unsqueeze(1), 
-            ref_hard_neg_tensor.transpose(1, 2)
-        ).squeeze(1)  # [B, K_ref]
-        
-        # 计算相似度差异 [B, K_hard, K_ref]
-        # sim_diff[b,i,j] = sim(query_b, hard_neg_i) - sim(query_b, ref_hard_neg_j)
-        sim_diff = sim_query_hard.unsqueeze(2) - sim_query_ref_hard.unsqueeze(1)  # [B, K_hard, K_ref]
-        
-        # ⭐ Pairwise Sigmoid Ranking
-        # 使用sigmoid将相似度差映射到概率空间
-        # sigmoid(sim_diff / T) → 1 表示 hard_neg 明显比 ref_hard_neg 相似度高
-        # sigmoid(sim_diff / T) → 0 表示 ref_hard_neg 相似度更高（需要惩罚）
-        temperature_ranking = 0.1  # 温度参数：越小sigmoid越陡峭，区分度越高
-        
-        # 计算logits（未经过sigmoid的原始分数）
-        logits = sim_diff / temperature_ranking  # [B, K_hard, K_ref]
-        
-        # 目标：所有pair的ranking概率都应该接近1
-        # 即：每个query硬负样本都应该比所有ref硬负样本相似度更高
-        target_probs = torch.ones_like(logits)
-        
-        # ✅ 使用BCEWithLogitsLoss（数值更稳定，兼容AMP）
-        # 内部会先做sigmoid再计算BCE，避免手动sigmoid带来的数值问题
-        # 比margin loss的优势：
-        # - 即使满足条件(sim_diff > 0)，仍有梯度驱动进一步优化
-        # - 梯度大小自适应：接近决策边界时梯度大，远离时梯度小
-        # - 兼容混合精度训练(AMP autocast)
-        loss_negative_ranking = F.binary_cross_entropy_with_logits(
-            logits,
-            target_probs,
-            reduction='mean'
-        )
-        
-        total_loss = total_loss + ref_hard_negative_weight * loss_ref_hard_negative + 0.5 * loss_negative_ranking
+        total_loss = total_loss + listwise_loss
     
     return total_loss
 
-def element_wise_sum(image_features: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
-    """
-    Compute normalized element-wise sum of image and text features.
-    This is the composed query representation for CLIP CIR.
-    
-    Args:
-        image_features: Reference image features (B, D)
-        text_features: Text query features (B, D)
-        
-    Returns:
-        Normalized composed features (B, D)
-    """
-    return F.normalize(image_features + text_features, dim=-1)
 
+def element_wise_sum(image_features: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
+    """Compute normalized element-wise sum."""
+    return F.normalize(image_features + text_features, dim=-1)
