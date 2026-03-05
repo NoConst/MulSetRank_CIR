@@ -345,6 +345,7 @@ def clip_finetune_fiq_ance(
     dist_info: Optional[dict] = None,
     deepspeed_config: str = None,
     grad_accum_steps: int = 1,
+    partial_intent_queries_path: str = None,
     **kwargs
 ):
     assert dist_info is not None
@@ -413,6 +414,13 @@ def clip_finetune_fiq_ance(
     relative_train_dataset = FashionIQDataset("train", train_dress_types, "relative", preprocess)
     use_ance_init = num_epochs >= ance_warmup_epochs
     classic_train_dataset = FashionIQDataset("train", train_dress_types, "classic", preprocess, preload_images=use_ance_init)
+
+    # Load partial intent queries for partial intent negative mining
+    partial_intent_queries = None
+    if partial_intent_queries_path and os.path.exists(partial_intent_queries_path):
+        with open(partial_intent_queries_path, "r") as f:
+            partial_intent_queries = json.load(f)
+        logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
 
     # DistributedSampler for training
     if dist_info["enabled"]:
@@ -540,9 +548,10 @@ def clip_finetune_fiq_ance(
             query_features = element_wise_sum(ref_features, text_features)
 
             hard_negative_names = None
+            hard_neg_indices = None
             if use_ance:
                 with torch.no_grad():
-                    _, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                    hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
                         query_features=query_features.detach(),
                         positive_names=list(target_names),
                         return_names=True
@@ -573,6 +582,32 @@ def clip_finetune_fiq_ance(
                     ref_hard_negative_features = all_ref_features.view(images_in_batch, num_ref_negatives, -1)
                     del all_ref_images, all_ref_features
 
+                # Mine partial intent negatives
+                partial_intent_negative_features = None
+                if partial_intent_queries is not None and hard_neg_indices is not None:
+                    partial_intents = [
+                        partial_intent_queries.get(cap, cap)
+                        for cap in input_captions
+                    ]
+                    pi_num_neg = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+                    with torch.no_grad():
+                        _, partial_intent_neg_names = hard_negative_miner.mine_partial_intent_negatives(
+                            partial_intent_texts=partial_intents,
+                            ref_features=ref_features.detach(),
+                            positive_names=list(target_names),
+                            hard_negative_indices=hard_neg_indices,
+                            num_negatives=pi_num_neg,
+                            clip_model=model_engine.module,
+                            tokenizer=tokenizer
+                        )
+                    num_pi_neg = len(partial_intent_neg_names[0])
+                    all_pi_names = [n for batch_names in partial_intent_neg_names for n in batch_names]
+                    all_pi_images = classic_train_dataset.get_images_batch(all_pi_names).to(device, non_blocking=True)
+                    all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
+                    all_pi_features = F.normalize(all_pi_features, dim=-1)
+                    partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
+                    del all_pi_images, all_pi_features
+
                 loss = compute_clip_ance_loss(
                     query_features=query_features,
                     target_features=target_features,
@@ -581,8 +616,8 @@ def clip_finetune_fiq_ance(
                     hard_negative_weight=ance_weight,
                     ref_hard_negative_features=ref_hard_negative_features,
                     ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
-                    text_intent_negative_features=None,
-                    text_intent_negative_weight=kwargs.get("text_intent_ance_weight", 1.0),
+                    partial_intent_negative_features=partial_intent_negative_features,
+                    partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
                 )
             else:
                 sim_matrix = torch.matmul(query_features, target_features.T) / 0.07
@@ -879,8 +914,8 @@ def clip_finetune_cirr_ance(
                     hard_negative_weight=ance_weight,
                     ref_hard_negative_features=None,
                     ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
-                    text_intent_negative_features=None,
-                    text_intent_negative_weight=kwargs.get("text_intent_ance_weight", 1.0),
+                    partial_intent_negative_features=None,
+                    partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
                 )
             else:
                 sim_matrix = torch.matmul(query_features, target_features.T) / 0.07
@@ -979,8 +1014,10 @@ if __name__ == "__main__":
     parser.add_argument("--ance-weight", default=1.0, type=float)
     parser.add_argument("--ance-warmup-epochs", default=0, type=int)
     parser.add_argument("--ref-ance-weight", default=0.5, type=float)
-    parser.add_argument("--text-intent-num-negatives", default=None, type=int)
-    parser.add_argument("--text-intent-ance-weight", default=0.75, type=float)
+    parser.add_argument("--partial-intent-num-negatives", default=None, type=int)
+    parser.add_argument("--partial-intent-weight", default=0.75, type=float)
+    parser.add_argument("--partial-intent-queries-path", type=str, default=None,
+                        help="Path to partial intent queries JSON file")
 
     # LoRA
     parser.add_argument("--use-lora", action="store_true")
@@ -1024,8 +1061,9 @@ if __name__ == "__main__":
         "ance_weight": args.ance_weight,
         "ance_warmup_epochs": args.ance_warmup_epochs,
         "ref_ance_weight": args.ref_ance_weight,
-        "text_intent_num_negatives": args.text_intent_num_negatives if args.text_intent_num_negatives else args.ance_num_negatives,
-        "text_intent_ance_weight": args.text_intent_ance_weight,
+        "partial_intent_num_negatives": args.partial_intent_num_negatives if args.partial_intent_num_negatives else args.ance_num_negatives,
+        "partial_intent_weight": args.partial_intent_weight,
+        "partial_intent_queries_path": args.partial_intent_queries_path,
         "use_lora": args.use_lora,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,

@@ -457,6 +457,96 @@ class CLIPHardNegativeMiner:
             features = self.target_embeddings[indices]
             return indices, features
 
+    @torch.no_grad()
+    def mine_partial_intent_negatives(
+        self,
+        partial_intent_texts: List[str],
+        ref_features: torch.Tensor,
+        positive_names: List[str],
+        hard_negative_indices: torch.Tensor,
+        num_negatives: int,
+        clip_model=None,
+        tokenizer=None
+    ) -> Tuple[torch.Tensor, List[List[str]]]:
+        """
+        使用预生成的 partial intent query + reference image 挖掘负样本。
+
+        对每个样本，将 partial intent text 编码后与 ref image features 组合，
+        在索引中检索最近邻作为负样本。
+
+        Args:
+            partial_intent_texts: 每个样本对应的 partial intent 文本
+            ref_features: [B, D] reference image features
+            positive_names: 正样本名称列表
+            hard_negative_indices: [B, N] 已有硬负样本索引（排除用）
+            num_negatives: 每个样本需要的负样本数量
+            clip_model: CLIP 模型
+            tokenizer: CLIP tokenizer
+
+        Returns:
+            partial_intent_neg_indices: [B, num_negatives]
+            partial_intent_neg_names: List[List[str]]
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Index not initialized.")
+        if clip_model is None or tokenizer is None:
+            raise ValueError("clip_model and tokenizer are required.")
+
+        device = self.target_embeddings.device
+        batch_size = ref_features.shape[0]
+        ref_features = F.normalize(ref_features.to(device), dim=-1)
+        hard_negative_indices = hard_negative_indices.to(device)
+        positive_indices = self._get_positive_indices_tensor(positive_names, device)
+
+        inputs = tokenizer(
+            partial_intent_texts,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt"
+        ).to(device)
+        with torch.cuda.amp.autocast():
+            partial_text_features = clip_model.get_text_features(**inputs)
+            partial_text_features = F.normalize(partial_text_features, dim=-1)
+
+        partial_query = F.normalize(ref_features + partial_text_features, dim=-1)
+
+        _, topk_indices = self._search_topk(partial_query, self.topk_candidates)
+
+        exclude_mask = (topk_indices == positive_indices.unsqueeze(1))
+        for k in range(hard_negative_indices.shape[1]):
+            exclude_mask = exclude_mask | (topk_indices == hard_negative_indices[:, k:k+1])
+
+        filtered_indices = topk_indices.clone()
+        filtered_indices[exclude_mask] = -1
+
+        partial_intent_neg_indices = torch.zeros(
+            batch_size, num_negatives, dtype=torch.long, device=device
+        )
+
+        for i in range(batch_size):
+            valid_mask = filtered_indices[i] != -1
+            valid_indices = filtered_indices[i][valid_mask]
+
+            if len(valid_indices) >= num_negatives:
+                partial_intent_neg_indices[i] = valid_indices[:num_negatives]
+            else:
+                partial_intent_neg_indices[i, :len(valid_indices)] = valid_indices
+                n_needed = num_negatives - len(valid_indices)
+                random_indices = torch.randint(
+                    0, len(self.target_names), (n_needed,),
+                    device=device, dtype=torch.long
+                )
+                partial_intent_neg_indices[i, len(valid_indices):] = random_indices
+
+        indices_cpu = partial_intent_neg_indices.cpu().numpy()
+        partial_intent_neg_names = [
+            [self.target_names[idx] for idx in indices_cpu[i]]
+            for i in range(batch_size)
+        ]
+
+        return partial_intent_neg_indices, partial_intent_neg_names
+
 
 def contrastive_in_batch_loss(query, target, temperature=0.07, normalized=False):
     """In-batch contrastive loss."""
@@ -580,8 +670,8 @@ def compute_clip_ance_loss(
     hard_negative_weight: float = 1.0,
     ref_hard_negative_features: Optional[torch.Tensor] = None,
     ref_hard_negative_weight: float = 1.0,
-    text_intent_negative_features: Optional[torch.Tensor] = None,
-    text_intent_negative_weight: float = 0.75
+    partial_intent_negative_features: Optional[torch.Tensor] = None,
+    partial_intent_negative_weight: float = 0.75
 ) -> torch.Tensor:
     """Compute ANCE-style contrastive loss with three-level negatives."""
     device = query_features.device
@@ -600,9 +690,9 @@ def compute_clip_ance_loss(
     if ref_hard_negative_features is not None and isinstance(ref_hard_negative_features, torch.Tensor):
         if ref_hard_negative_features.device != device:
             ref_hard_negative_features = ref_hard_negative_features.to(device, non_blocking=True)
-    if text_intent_negative_features is not None and isinstance(text_intent_negative_features, torch.Tensor):
-        if text_intent_negative_features.device != device:
-            text_intent_negative_features = text_intent_negative_features.to(device, non_blocking=True)
+    if partial_intent_negative_features is not None and isinstance(partial_intent_negative_features, torch.Tensor):
+        if partial_intent_negative_features.device != device:
+            partial_intent_negative_features = partial_intent_negative_features.to(device, non_blocking=True)
     
     # 统一归一化
     query_features = F.normalize(query_features, dim=-1)
@@ -652,14 +742,14 @@ def compute_clip_ance_loss(
     # total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative
     # total_loss = loss_in_batch + loss_hard_in_batch
     
-    # Text intent negative loss
-    text_intent_neg_tensor = None
-    if text_intent_negative_features is not None:
-        text_intent_neg_tensor = F.normalize(text_intent_negative_features, dim=-1)
-        loss_text_intent = contrastive_loss_hard_negative(
-            query_features, target_features, text_intent_neg_tensor, temperature, normalized=True
+    # Partial intent negative loss
+    partial_intent_neg_tensor = None
+    if partial_intent_negative_features is not None:
+        partial_intent_neg_tensor = F.normalize(partial_intent_negative_features, dim=-1)
+        loss_partial_intent = contrastive_loss_hard_negative(
+            query_features, target_features, partial_intent_neg_tensor, temperature, normalized=True
         )
-        total_loss = total_loss + text_intent_negative_weight * loss_text_intent
+        total_loss = total_loss + partial_intent_negative_weight * loss_partial_intent
     
     # Reference hard negative loss
     ref_hard_neg_tensor = None
@@ -667,16 +757,16 @@ def compute_clip_ance_loss(
         ref_hard_neg_tensor = F.normalize(ref_hard_negative_features, dim=-1)
     
     # 使用 Listwise 排序来形成负样本之间的偏序
-    # 期望的排序：hard > text_intent > ref_hard
+    # 期望的排序：hard > partial_intent > ref_hard
     negative_features_list = []
-    if text_intent_neg_tensor is not None:
-        # 如果有 text_intent，则排序为：hard > text_intent > ref_hard
+    if partial_intent_neg_tensor is not None:
+        # 排序为：hard > partial_intent > ref_hard
         negative_features_list.append(hard_neg_tensor)  # 最高优先级
-        negative_features_list.append(text_intent_neg_tensor)  # 中等优先级
+        negative_features_list.append(partial_intent_neg_tensor)  # 中等优先级
         if ref_hard_neg_tensor is not None:
             negative_features_list.append(ref_hard_neg_tensor)  # 最低优先级
     elif ref_hard_neg_tensor is not None:
-        # 如果没有 text_intent，则排序为：hard > ref_hard
+        # 如果没有 partial_intent，则排序为：hard > ref_hard
         negative_features_list.append(hard_neg_tensor)
         negative_features_list.append(ref_hard_neg_tensor)
     
