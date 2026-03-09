@@ -185,7 +185,6 @@ def deepspeed_save_hf_pretrained(
 ):
     """Save HF model under DeepSpeed correctly (rank0-only state dict)."""
     if not is_main_process(dist_info):
-        barrier(dist_info)
         return
 
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -196,8 +195,6 @@ def deepspeed_save_hf_pretrained(
     # Save using HuggingFace's save_pretrained
     model.save_pretrained(str(save_dir))
     tokenizer.save_pretrained(str(save_dir))
-    
-    barrier(dist_info)
 
 def deepspeed_save_checkpoint(
     model_engine,
@@ -499,6 +496,7 @@ def clip_finetune_fiq_ance(
     best_avg_recall = 0.0 if save_best else None
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
+    use_ance = 0 >= ance_warmup_epochs
 
     logger.info("Training loop started (DeepSpeed ZeRO-2 enabled)")
     for epoch in range(num_epochs):
@@ -690,7 +688,18 @@ def clip_finetune_fiq_ance(
                     deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "best_model", dist_info)
                     logger.info(f"Saved best model at epoch {epoch} with recall {best_avg_recall:.2f}")
 
+            if save_training:
+                deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "latest_model", dist_info)
+                if is_main_process(dist_info):
+                    logger.info(f"Saved latest model at epoch {epoch}")
+
             barrier(dist_info)
+
+    if save_training:
+        deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "final_model", dist_info)
+        if is_main_process(dist_info):
+            logger.info(f"Saved final model to {training_path / 'final_model'}")
+    barrier(dist_info)
 
 def clip_finetune_cirr_ance(
     num_epochs: int,
@@ -715,6 +724,7 @@ def clip_finetune_cirr_ance(
     dist_info: Optional[dict] = None,
     deepspeed_config: str = None,
     grad_accum_steps: int = 1,
+    partial_intent_queries_path: str = None,
     **kwargs
 ):
     assert dist_info is not None
@@ -777,6 +787,13 @@ def clip_finetune_cirr_ance(
 
     use_ance_init = num_epochs >= ance_warmup_epochs
     classic_train_dataset = CIRRDataset("train", "classic", preprocess, preload_images=use_ance_init)
+
+    # Load partial intent queries for partial intent negative mining
+    partial_intent_queries = None
+    if partial_intent_queries_path and os.path.exists(partial_intent_queries_path):
+        with open(partial_intent_queries_path, "r") as f:
+            partial_intent_queries = json.load(f)
+        logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
 
     if dist_info["enabled"]:
         train_sampler = DistributedSampler(relative_train_dataset, shuffle=True, drop_last=True)
@@ -847,13 +864,15 @@ def clip_finetune_cirr_ance(
     best_arithmetic = 0.0 if save_best else None
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
+    use_ance = 0 >= ance_warmup_epochs
 
     logger.info("Training loop started for CIRR (DeepSpeed ZeRO-2 enabled)")
     for epoch in range(num_epochs):
         if dist_info["enabled"]:
             train_sampler.set_epoch(epoch)
 
-        if epoch > 0:
+        # Refresh ANCE index periodically
+        if epoch > 0 and use_ance:
             model_engine.eval()
             hard_negative_miner.refresh_index(
                 clip_model=model_engine.module,
@@ -889,10 +908,16 @@ def clip_finetune_cirr_ance(
             query_features = element_wise_sum(ref_features, text_features)
 
             hard_negative_names = None
+            hard_neg_indices = None
             if use_ance:
                 with torch.no_grad():
-                    _, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                    hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
                         query_features=query_features.detach(),
+                        positive_names=list(target_names),
+                        return_names=True
+                    )
+                    _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                        query_features=ref_features.detach(),
                         positive_names=list(target_names),
                         return_names=True
                     )
@@ -900,11 +925,47 @@ def clip_finetune_cirr_ance(
             if use_ance and hard_negative_names is not None:
                 num_negatives = len(hard_negative_names[0])
                 all_neg_names = [n for batch_names in hard_negative_names for n in batch_names]
-                all_neg_images = classic_train_dataset.get_images_batch(all_neg_names).clone().contiguous().to(device, non_blocking=True).float()
+                all_neg_images = classic_train_dataset.get_images_batch(all_neg_names).to(device, non_blocking=True)
                 all_neg_features = model_engine.module.get_image_features(pixel_values=all_neg_images)
-                all_neg_features = F.normalize(all_neg_features.clone(), dim=-1)
-                hard_negative_features = all_neg_features.reshape(images_in_batch, num_negatives, -1)
+                all_neg_features = F.normalize(all_neg_features, dim=-1)
+                hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
                 del all_neg_images, all_neg_features
+
+                ref_hard_negative_features = None
+                if ref_hard_negative_names is not None:
+                    num_ref_negatives = len(ref_hard_negative_names[0])
+                    all_ref_names = [n for batch_names in ref_hard_negative_names for n in batch_names]
+                    all_ref_images = classic_train_dataset.get_images_batch(all_ref_names).to(device, non_blocking=True)
+                    all_ref_features = model_engine.module.get_image_features(pixel_values=all_ref_images)
+                    all_ref_features = F.normalize(all_ref_features, dim=-1)
+                    ref_hard_negative_features = all_ref_features.view(images_in_batch, num_ref_negatives, -1)
+                    del all_ref_images, all_ref_features
+
+                # Mine partial intent negatives
+                partial_intent_negative_features = None
+                if partial_intent_queries is not None and hard_neg_indices is not None:
+                    partial_intents = [
+                        partial_intent_queries.get(cap, cap)
+                        for cap in input_captions
+                    ]
+                    pi_num_neg = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+                    with torch.no_grad():
+                        _, partial_intent_neg_names = hard_negative_miner.mine_partial_intent_negatives(
+                            partial_intent_texts=partial_intents,
+                            ref_features=ref_features.detach(),
+                            positive_names=list(target_names),
+                            hard_negative_indices=hard_neg_indices,
+                            num_negatives=pi_num_neg,
+                            clip_model=model_engine.module,
+                            tokenizer=tokenizer
+                        )
+                    num_pi_neg = len(partial_intent_neg_names[0])
+                    all_pi_names = [n for batch_names in partial_intent_neg_names for n in batch_names]
+                    all_pi_images = classic_train_dataset.get_images_batch(all_pi_names).to(device, non_blocking=True)
+                    all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
+                    all_pi_features = F.normalize(all_pi_features, dim=-1)
+                    partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
+                    del all_pi_images, all_pi_features
 
                 loss = compute_clip_ance_loss(
                     query_features=query_features,
@@ -912,9 +973,9 @@ def clip_finetune_cirr_ance(
                     hard_negative_features=hard_negative_features,
                     temperature=0.07,
                     hard_negative_weight=ance_weight,
-                    ref_hard_negative_features=None,
+                    ref_hard_negative_features=ref_hard_negative_features,
                     ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
-                    partial_intent_negative_features=None,
+                    partial_intent_negative_features=partial_intent_negative_features,
                     partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
                 )
             else:
@@ -984,7 +1045,18 @@ def clip_finetune_cirr_ance(
                     deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "best_model", dist_info)
                     logger.info(f"Saved best model at epoch {epoch} with arithmetic mean {best_arithmetic:.2f}")
 
+            if save_training:
+                deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "latest_model", dist_info)
+                if is_main_process(dist_info):
+                    logger.info(f"Saved latest model at epoch {epoch}")
+
             barrier(dist_info)
+
+    if save_training:
+        deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "final_model", dist_info)
+        if is_main_process(dist_info):
+            logger.info(f"Saved final model to {training_path / 'final_model'}")
+    barrier(dist_info)
 
 def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
@@ -1082,4 +1154,3 @@ if __name__ == "__main__":
             "val_dress_types": ["dress", "toptee", "shirt"]
         })
         clip_finetune_fiq_ance(**training_hyper_params)
-
