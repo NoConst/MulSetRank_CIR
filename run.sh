@@ -45,44 +45,69 @@ CUDA_VISIBLE_DEVICES=3 nohup python src/clip_fine_tune_ance.py \
 nohup ./run_clip_ance_deepspeed.sh 4 > train_deepspeed.log 2>&1 &
 
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 nohup torchrun --nproc_per_node=4 src/fsdp_clip_ance_train.py \
-  --dataset fashionIQ \
-  --clip-model-name ViT-H/14 \
-  --batch-size 8 \
-  --num-epochs 20 \
-  --learning-rate 5e-5 \
-  --ance-num-negatives 4 \
-  --use-lora \
-  --lora-r 32 \
-  --lora-alpha 64 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_ance_train.py \
+    --dataset fashionIQ \
+    --clip-model-name "ViT-H/14" \
+    --batch-size 8 \
+    --num-epochs 20 \
+    --learning-rate 5e-5 \
+    --ance-num-negatives 3 \
+    --use-lora \
+    --ance-warmup-epochs 0 \
+    --lora-r 16 \
+    --lora-alpha 32 \
+    --init-temperature 0.03 \
+    --logit-scale-lr 5e-6 \
+    --save-training \
+    --save-best \
+    --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
+    --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_fiq_H_14_partial_intent.log &
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_fusion_ance_train.py \
+  --dataset fashioniq \
+  --clip-model-name "ViT-H/14" \
+  --pretrained-clip-path models/clip_ance_fiq_ViT-H-14_lora_2026-03-07_13:43:47/best_model \
+  --deepspeed-config ds_config_zero2.json \
+  --ance-num-negatives 3 \
+  --num-cross-attn-layers 4 \
+  --num-heads 8 \
+  --num-aux-tokens 4 \
+  --num-epochs 50 \
+  --batch-size 128 \
+  --learning-rate 2e-4 \
   --ance-warmup-epochs 0 \
-  --use-fsdp > fsdp_clip_ance_fiq.log &
+  --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
+  --save-training --save-best > deepspeed_clip_bicross_fusion_fiq_H_14.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 --master_port=29604 src/deepspeed_clip_fusion_ance_train.py \
+  --dataset fashioniq \
+  --clip-model-name "ViT-H/14" \
+  --pretrained-clip-path models/clip_ance_fiq_ViT-H-14_lora_2026-03-07_13:43:47/best_model \
+  --deepspeed-config ds_config_zero2.json \
+  --ance-num-negatives 3 \
+  --fusion-type mlp_residual \
+  --mlp-hidden-mult 2.0 \
+  --num-epochs 50 \
+  --batch-size 128 \
+  --learning-rate 1e-4 \
+  --ance-warmup-epochs 0 \
+  --experiment-name mlp_residual_h2 \
+  --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
+  --save-training --save-best > deepspeed_clip_mlp_fusion_fiq_H_14_neg_6_h2.log 2>&1 &
 
 
-1、去掉loss hard negative
-2、去掉loss hard in batch
-3、
 
+python src/generate_partial_intent_queries.py \
+    --dress_types dress shirt toptee \
+    --max_workers 8 \
+    --output_dir outputs/fiq_partial_intent_queries
 
+nohup python src/generate_single_intent_queries.py \
+    --dataset fashioniq \
+    --max_workers 8 \
+    --output_dir outputs/fiq_single_intent_queries > fiq_single_intent_queries.log 2>&1 &
 
-# CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_ance_train.py \
-#     --dataset cirr \
-#     --clip-model-name "ViT-H/14" \
-#     --batch-size 8 \
-#     --num-epochs 8 \
-#     --learning-rate 5e-5 \
-#     --ance-num-negatives 4 \
-#     --use-lora \
-#     --lora-r 16 \
-#     --lora-alpha 32 \
-#     --save-training --save-best \
-#     --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_cirr_H_14_neg_4_with_lora_16_32.log &
-
-
-# deepspeed --num_gpus 4 src/deepspeed_blip2_ance_train.py \
-#   --dataset fashioniq \
-#   --blip-model-name blip2_cir_align_prompt --backbone pretrain \
-#   --batch-size 32 --grad-accum-steps 4 \
-#   --learning-rate 2e-6 \
-#   --ance-num-negatives 10 --ance-topk-candidates 100 --ance-weight 1.0 --ance-warmup-epochs 0 \
-#   --deepspeed-config ds_config_zero2.json
+nohup python src/generate_single_intent_queries.py \
+    --dataset cirr \
+    --max_workers 8 \
+    --output_dir outputs/cirr_single_intent_queries > cirr_single_intent_queries.log 2>&1 &
