@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CLIP_TEMPERATURE = 0.07
 MAX_LOGIT_SCALE = float(np.log(100.0))
+LOGIT_SCALE_STATE_FILENAME = "logit_scale.pt"
 
 
 def get_similarity_scale(
@@ -65,6 +66,23 @@ def get_model_logit_scale(model) -> Optional[torch.Tensor]:
     return None
 
 
+def temperature_bounds_to_logit_scale_bounds(
+    min_temperature: float,
+    max_temperature: float,
+) -> Tuple[float, float]:
+    """Convert temperature bounds to logit_scale bounds."""
+    min_temperature = float(min_temperature)
+    max_temperature = float(max_temperature)
+    if min_temperature <= 0 or max_temperature <= 0:
+        raise ValueError("Temperature bounds must be positive.")
+    if min_temperature > max_temperature:
+        raise ValueError("min_temperature must be <= max_temperature.")
+
+    min_logit_scale = float(np.log(1.0 / max_temperature))
+    max_logit_scale = float(np.log(1.0 / min_temperature))
+    return min_logit_scale, max_logit_scale
+
+
 def enable_model_logit_scale_training(model, log: Optional[logging.Logger] = None) -> Optional[torch.Tensor]:
     """Ensure logit_scale stays trainable even when PEFT freezes base parameters."""
     logit_scale = get_model_logit_scale(model)
@@ -81,6 +99,96 @@ def enable_model_logit_scale_training(model, log: Optional[logging.Logger] = Non
         log.info(f"Enabled learnable logit_scale (initial temperature={initial_temperature:.4f})")
 
     return logit_scale
+
+
+def set_model_logit_scale(
+    model,
+    temperature: float,
+    log: Optional[logging.Logger] = None,
+) -> Optional[torch.Tensor]:
+    """Reset CLIP logit_scale to a target temperature."""
+    logit_scale = get_model_logit_scale(model)
+    if logit_scale is None:
+        if log is not None:
+            log.warning("Could not find CLIP logit_scale parameter; reset skipped.")
+        return None
+
+    target_value = float(np.log(1.0 / float(temperature)))
+    with torch.no_grad():
+        logit_scale.copy_(
+            torch.tensor(target_value, dtype=logit_scale.dtype, device=logit_scale.device)
+        )
+
+    if log is not None:
+        log.info(f"Reset logit_scale to temperature={float(temperature):.4f}")
+
+    return logit_scale
+
+
+def clamp_logit_scale_(
+    logit_scale: Optional[torch.Tensor],
+    min_temperature: float,
+    max_temperature: float,
+) -> Optional[torch.Tensor]:
+    """Clamp logit_scale in-place using temperature bounds."""
+    if logit_scale is None:
+        return None
+
+    min_logit_scale, max_logit_scale = temperature_bounds_to_logit_scale_bounds(
+        min_temperature=min_temperature,
+        max_temperature=max_temperature,
+    )
+    with torch.no_grad():
+        logit_scale.clamp_(min=min_logit_scale, max=max_logit_scale)
+    return logit_scale
+
+
+def save_model_logit_scale(
+    model,
+    save_dir: Union[str, Path],
+    log: Optional[logging.Logger] = None,
+) -> bool:
+    """Persist learned logit_scale alongside adapter checkpoints."""
+    logit_scale = get_model_logit_scale(model)
+    if logit_scale is None:
+        return False
+
+    save_path = Path(save_dir) / LOGIT_SCALE_STATE_FILENAME
+    torch.save({"logit_scale": logit_scale.detach().cpu()}, save_path)
+    if log is not None:
+        log.info(f"Saved logit_scale to {save_path}")
+    return True
+
+
+def load_model_logit_scale(
+    model,
+    load_dir: Union[str, Path],
+    log: Optional[logging.Logger] = None,
+) -> bool:
+    """Load a previously saved logit_scale if present."""
+    logit_scale = get_model_logit_scale(model)
+    if logit_scale is None:
+        return False
+
+    load_path = Path(load_dir) / LOGIT_SCALE_STATE_FILENAME
+    if not load_path.exists():
+        return False
+
+    state = torch.load(load_path, map_location="cpu")
+    saved_logit_scale = state.get("logit_scale")
+    if saved_logit_scale is None:
+        return False
+
+    with torch.no_grad():
+        logit_scale.copy_(
+            saved_logit_scale.to(device=logit_scale.device, dtype=logit_scale.dtype)
+        )
+
+    if log is not None:
+        restored_temperature = 1.0 / float(get_similarity_scale(logit_scale=logit_scale).detach().cpu().item())
+        log.info(f"Restored logit_scale from {load_path} (temperature={restored_temperature:.4f})")
+
+    return True
 
 
 class CLIPHardNegativeMiner:
@@ -855,9 +963,16 @@ def compute_clip_ance_loss(
     partial_intent_negative_weight: float = 0.75,
     logit_scale: Optional[torch.Tensor] = None,
     max_logit_scale: float = MAX_LOGIT_SCALE,
+    **legacy_kwargs,
 ) -> torch.Tensor:
     """Compute ANCE-style contrastive loss with three-level negatives."""
     device = query_features.device
+
+    # Backward compatibility with older training scripts.
+    if partial_intent_negative_features is None and legacy_kwargs.get("text_intent_negative_features") is not None:
+        partial_intent_negative_features = legacy_kwargs["text_intent_negative_features"]
+    if "text_intent_negative_weight" in legacy_kwargs:
+        partial_intent_negative_weight = legacy_kwargs["text_intent_negative_weight"]
     
     if isinstance(hard_negative_features, np.ndarray):
         hard_neg_tensor = torch.from_numpy(hard_negative_features).float().to(device)

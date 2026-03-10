@@ -37,7 +37,17 @@ from peft import LoraConfig, get_peft_model
 
 from data_utils import base_path, squarepad_transform, targetpad_transform, CIRRDataset, FashionIQDataset
 from utils import collate_fn, update_train_running_results, set_train_bar_description, element_wise_sum
-from clip_ance_utils import CLIPHardNegativeMiner, compute_clip_ance_loss
+from clip_ance_utils import (
+    CLIPHardNegativeMiner,
+    clamp_logit_scale_,
+    compute_clip_ance_loss,
+    enable_model_logit_scale_training,
+    get_model_logit_scale,
+    get_similarity_scale,
+    save_model_logit_scale,
+    set_model_logit_scale,
+    temperature_bounds_to_logit_scale_bounds,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -109,7 +119,8 @@ def get_clip_model_and_processor(
     use_lora: bool = False,
     lora_r: int = 8,
     lora_alpha: int = 16,
-    lora_dropout: float = 0.1
+    lora_dropout: float = 0.1,
+    init_temperature: Optional[float] = None,
 ):
     # Map simple names to HF model IDs
     hf_model_name = CLIP_MODEL_MAPPING.get(model_name, model_name)
@@ -131,12 +142,18 @@ def get_clip_model_and_processor(
             modules_to_save=None,
         )
         model = get_peft_model(model, lora_config)
+        enable_model_logit_scale_training(model, logger)
         trainable_params, all_params = model.get_nb_trainable_parameters()
         logger.info(
             f"LoRA enabled: trainable params: {trainable_params:,} || "
             f"all params: {all_params:,} || "
             f"trainable%: {100 * trainable_params / all_params:.4f}%"
         )
+    else:
+        enable_model_logit_scale_training(model, logger)
+
+    if init_temperature is not None:
+        set_model_logit_scale(model, init_temperature, logger)
 
     # Move model to device
     model = model.to(device)
@@ -195,6 +212,7 @@ def deepspeed_save_hf_pretrained(
     # Save using HuggingFace's save_pretrained
     model.save_pretrained(str(save_dir))
     tokenizer.save_pretrained(str(save_dir))
+    save_model_logit_scale(model, save_dir, logger)
 
 def deepspeed_save_checkpoint(
     model_engine,
@@ -203,6 +221,45 @@ def deepspeed_save_checkpoint(
 ):
     """Save DeepSpeed checkpoint (includes optimizer states for ZeRO)."""
     model_engine.save_checkpoint(str(save_dir), client_state=client_state)
+
+
+def build_trainable_param_groups(
+    model,
+    base_learning_rate: float,
+    logit_scale_learning_rate: Optional[float],
+    weight_decay: float,
+):
+    """Create dedicated optimizer groups so logit_scale can use a smaller LR."""
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    logit_scale = get_model_logit_scale(model)
+    if logit_scale is None or not logit_scale.requires_grad:
+        return trainable_params
+
+    regular_params = [param for param in trainable_params if param is not logit_scale]
+    logit_scale_lr = logit_scale_learning_rate if logit_scale_learning_rate is not None else base_learning_rate * 0.1
+
+    logger.info(
+        f"Using dedicated logit_scale param group: base_lr={base_learning_rate:.2e}, "
+        f"logit_scale_lr={logit_scale_lr:.2e}"
+    )
+
+    param_groups = []
+    if regular_params:
+        param_groups.append(
+            {
+                "params": regular_params,
+                "lr": base_learning_rate,
+                "weight_decay": weight_decay,
+            }
+        )
+    param_groups.append(
+        {
+            "params": [logit_scale],
+            "lr": logit_scale_lr,
+            "weight_decay": 0.0,
+        }
+    )
+    return param_groups
 
 # =========================================================
 # Validation metrics (unchanged except device passed in)
@@ -347,6 +404,12 @@ def clip_finetune_fiq_ance(
 ):
     assert dist_info is not None
     device = torch.device(f"cuda:{dist_info['local_rank']}") if torch.cuda.is_available() else torch.device("cpu")
+    init_temperature = kwargs.get("init_temperature")
+    min_temperature = kwargs.get("min_temperature", 0.01)
+    max_temperature = kwargs.get("max_temperature", 0.07)
+    logit_scale_lr = kwargs.get("logit_scale_lr")
+    logit_scale_warmup_epochs = kwargs.get("logit_scale_warmup_epochs", 0)
+    _, max_logit_scale = temperature_bounds_to_logit_scale_bounds(min_temperature, max_temperature)
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -364,7 +427,11 @@ def clip_finetune_fiq_ance(
 
     clip_model, processor, tokenizer, embedding_dim = get_clip_model_and_processor(
         clip_model_name, device,
-        use_lora=use_lora, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout
+        use_lora=use_lora,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        init_temperature=init_temperature,
     )
 
     # Save hyperparameters (rank0 only)
@@ -386,6 +453,13 @@ def clip_finetune_fiq_ance(
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
+            "learnable_temperature": True,
+            "init_temperature": init_temperature,
+            "min_temperature": min_temperature,
+            "max_temperature": max_temperature,
+            "logit_scale_lr": logit_scale_lr if logit_scale_lr is not None else learning_rate * 0.1,
+            "logit_scale_warmup_epochs": logit_scale_warmup_epochs,
+            "max_logit_scale": float(np.exp(max_logit_scale)),
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
@@ -474,13 +548,22 @@ def clip_finetune_fiq_ance(
     # Update optimizer lr
     if "optimizer" in ds_config and "params" in ds_config["optimizer"]:
         ds_config["optimizer"]["params"]["lr"] = learning_rate
+    optimizer_weight_decay = ds_config.get("optimizer", {}).get("params", {}).get("weight_decay", 0.0)
+    model_parameters = build_trainable_param_groups(
+        clip_model,
+        base_learning_rate=learning_rate,
+        logit_scale_learning_rate=logit_scale_lr,
+        weight_decay=optimizer_weight_decay,
+    )
     
     # Initialize DeepSpeed with model and optimizer
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=clip_model,
-        model_parameters=clip_model.parameters(),
+        model_parameters=model_parameters,
         config=ds_config,
     )
+    train_logit_scale = get_model_logit_scale(model_engine.module)
+    clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
     # Create scheduler manually (DeepSpeed's OneCycle scheduler has limited flexibility)
     # We'll use PyTorch's OneCycleLR instead
@@ -502,6 +585,11 @@ def clip_finetune_fiq_ance(
     for epoch in range(num_epochs):
         if dist_info["enabled"]:
             train_sampler.set_epoch(epoch)
+
+        if train_logit_scale is not None:
+            train_logit_scale.requires_grad_(epoch >= logit_scale_warmup_epochs)
+            if epoch == logit_scale_warmup_epochs and is_main_process(dist_info):
+                logger.info(f"Enabled logit_scale updates at epoch {epoch}")
 
         # Refresh ANCE index periodically
         if epoch > 0 and use_ance:
@@ -610,21 +698,24 @@ def clip_finetune_fiq_ance(
                     query_features=query_features,
                     target_features=target_features,
                     hard_negative_features=hard_negative_features,
-                    temperature=0.07,
                     hard_negative_weight=ance_weight,
                     ref_hard_negative_features=ref_hard_negative_features,
                     ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
                     partial_intent_negative_features=partial_intent_negative_features,
                     partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
+                    logit_scale=train_logit_scale,
+                    max_logit_scale=max_logit_scale,
                 )
             else:
-                sim_matrix = torch.matmul(query_features, target_features.T) / 0.07
+                scale = get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale)
+                sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
                 labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
                 loss = F.cross_entropy(sim_matrix, labels)
 
             # DeepSpeed handles backward, gradient accumulation, and optimizer step
             model_engine.backward(loss)
             model_engine.step()
+            clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
             # Step scheduler at the right frequency
             if (step + 1) % grad_accum_steps == 0:
@@ -642,7 +733,10 @@ def clip_finetune_fiq_ance(
 
         if is_main_process(dist_info):
             avg_loss = (total_loss.item() / max(int(total_imgs.item()), 1))
-            loss_log_dict = {"epoch": epoch, "loss": avg_loss}
+            current_temperature = 1.0 / float(
+                get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale).detach().cpu().item()
+            )
+            loss_log_dict = {"epoch": epoch, "loss": avg_loss, "temperature": current_temperature}
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
             training_log_frame.to_csv(str(training_path / "train_metrics.csv"), index=False)
 
@@ -729,6 +823,12 @@ def clip_finetune_cirr_ance(
 ):
     assert dist_info is not None
     device = torch.device(f"cuda:{dist_info['local_rank']}") if torch.cuda.is_available() else torch.device("cpu")
+    init_temperature = kwargs.get("init_temperature")
+    min_temperature = kwargs.get("min_temperature", 0.01)
+    max_temperature = kwargs.get("max_temperature", 0.07)
+    logit_scale_lr = kwargs.get("logit_scale_lr")
+    logit_scale_warmup_epochs = kwargs.get("logit_scale_warmup_epochs", 0)
+    _, max_logit_scale = temperature_bounds_to_logit_scale_bounds(min_temperature, max_temperature)
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -745,7 +845,11 @@ def clip_finetune_cirr_ance(
 
     clip_model, processor, tokenizer, embedding_dim = get_clip_model_and_processor(
         clip_model_name, device,
-        use_lora=use_lora, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout
+        use_lora=use_lora,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        init_temperature=init_temperature,
     )
 
     if is_main_process(dist_info):
@@ -766,6 +870,13 @@ def clip_finetune_cirr_ance(
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
+            "learnable_temperature": True,
+            "init_temperature": init_temperature,
+            "min_temperature": min_temperature,
+            "max_temperature": max_temperature,
+            "logit_scale_lr": logit_scale_lr if logit_scale_lr is not None else learning_rate * 0.1,
+            "logit_scale_warmup_epochs": logit_scale_warmup_epochs,
+            "max_logit_scale": float(np.exp(max_logit_scale)),
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
@@ -846,12 +957,21 @@ def clip_finetune_cirr_ance(
     
     if "optimizer" in ds_config and "params" in ds_config["optimizer"]:
         ds_config["optimizer"]["params"]["lr"] = learning_rate
+    optimizer_weight_decay = ds_config.get("optimizer", {}).get("params", {}).get("weight_decay", 0.0)
+    model_parameters = build_trainable_param_groups(
+        clip_model,
+        base_learning_rate=learning_rate,
+        logit_scale_learning_rate=logit_scale_lr,
+        weight_decay=optimizer_weight_decay,
+    )
     
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=clip_model,
-        model_parameters=clip_model.parameters(),
+        model_parameters=model_parameters,
         config=ds_config,
     )
+    train_logit_scale = get_model_logit_scale(model_engine.module)
+    clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
     scheduler = OneCycleLR(
         optimizer.optimizer,
@@ -870,6 +990,11 @@ def clip_finetune_cirr_ance(
     for epoch in range(num_epochs):
         if dist_info["enabled"]:
             train_sampler.set_epoch(epoch)
+
+        if train_logit_scale is not None:
+            train_logit_scale.requires_grad_(epoch >= logit_scale_warmup_epochs)
+            if epoch == logit_scale_warmup_epochs and is_main_process(dist_info):
+                logger.info(f"Enabled logit_scale updates at epoch {epoch}")
 
         # Refresh ANCE index periodically
         if epoch > 0 and use_ance:
@@ -971,20 +1096,23 @@ def clip_finetune_cirr_ance(
                     query_features=query_features,
                     target_features=target_features,
                     hard_negative_features=hard_negative_features,
-                    temperature=0.07,
                     hard_negative_weight=ance_weight,
                     ref_hard_negative_features=ref_hard_negative_features,
                     ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
                     partial_intent_negative_features=partial_intent_negative_features,
                     partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
+                    logit_scale=train_logit_scale,
+                    max_logit_scale=max_logit_scale,
                 )
             else:
-                sim_matrix = torch.matmul(query_features, target_features.T) / 0.07
+                scale = get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale)
+                sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
                 labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
                 loss = F.cross_entropy(sim_matrix, labels)
 
             model_engine.backward(loss)
             model_engine.step()
+            clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
             if (step + 1) % grad_accum_steps == 0:
                 scheduler.step()
@@ -1000,7 +1128,10 @@ def clip_finetune_cirr_ance(
 
         if is_main_process(dist_info):
             avg_loss = (total_loss.item() / max(int(total_imgs.item()), 1))
-            loss_log_dict = {"epoch": epoch, "loss": avg_loss}
+            current_temperature = 1.0 / float(
+                get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale).detach().cpu().item()
+            )
+            loss_log_dict = {"epoch": epoch, "loss": avg_loss, "temperature": current_temperature}
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
             training_log_frame.to_csv(str(training_path / "train_metrics.csv"), index=False)
 
@@ -1062,6 +1193,7 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 if __name__ == "__main__":
@@ -1096,6 +1228,17 @@ if __name__ == "__main__":
     parser.add_argument("--lora-r", default=8, type=int)
     parser.add_argument("--lora-alpha", default=16, type=int)
     parser.add_argument("--lora-dropout", default=0.1, type=float)
+    parser.add_argument("--init-temperature", default=0.03, type=float,
+                        help="Reset CLIP temperature before training. Lower is sharper.")
+    parser.add_argument("--min-temperature", default=0.01, type=float,
+                        help="Smallest allowed temperature during training.")
+    parser.add_argument("--max-temperature", default=0.07, type=float,
+                        help="Largest allowed temperature during training.")
+    parser.add_argument("--logit-scale-lr", default=None, type=float,
+                        help="Optional dedicated learning rate for CLIP logit_scale.")
+    parser.add_argument("--logit-scale-warmup-epochs", default=1, type=int,
+                        help="Freeze logit_scale updates for the first N epochs.")
+    parser.add_argument("--seed", default=41, type=int)
 
     # DeepSpeed
     parser.add_argument("--deepspeed-config", type=str, default="ds_config_zero2.json",
@@ -1113,7 +1256,7 @@ if __name__ == "__main__":
     dist_info = init_distributed()
 
     # Keep same default seed; distributed sampler handles shuffling via set_epoch
-    set_seed(41)
+    set_seed(args.seed)
 
     training_hyper_params = {
         "num_epochs": args.num_epochs,
@@ -1140,6 +1283,13 @@ if __name__ == "__main__":
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
+        "learnable_temperature": True,
+        "init_temperature": args.init_temperature,
+        "min_temperature": args.min_temperature,
+        "max_temperature": args.max_temperature,
+        "logit_scale_lr": args.logit_scale_lr,
+        "logit_scale_warmup_epochs": args.logit_scale_warmup_epochs,
+        "seed": args.seed,
         # DeepSpeed
         "dist_info": dist_info,
         "deepspeed_config": args.deepspeed_config,

@@ -66,7 +66,10 @@ def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset,CIR
     for names, images in tqdm(classic_val_loader):
         images = images.to(device, non_blocking=True)
         with torch.no_grad():
-            image_features, image_embeds_frozen = blip_model.extract_target_features(images,  mode="mean")
+            # Important: under DeepSpeed fp16, BLIP2 weights may be half while inputs are float.
+            # Use autocast to keep internal dtypes consistent and avoid Float vs Half matmul errors.
+            with torch.cuda.amp.autocast():
+                image_features, image_embeds_frozen = blip_model.extract_target_features(images, mode="mean")
             # Move to CPU immediately if save_memory is enabled
             if save_memory:
                 image_features = image_features.cpu()
@@ -133,17 +136,19 @@ def generate_randomized_fiq_caption(flattened_captions: List[str]) -> List[str]:
     """
     captions = []
     for i in range(0, len(flattened_captions), 2):
-        random_num = random.random()
-        if random_num < 0.25:
-            captions.append(
+        captions.append(
                 f"{flattened_captions[i].strip('.?, ').capitalize()} and {flattened_captions[i + 1].strip('.?, ')}")
-        elif 0.25 < random_num < 0.5:
-            captions.append(
-                f"{flattened_captions[i + 1].strip('.?, ').capitalize()} and {flattened_captions[i].strip('.?, ')}")
-        elif 0.5 < random_num < 0.75:
-            captions.append(f"{flattened_captions[i].strip('.?, ').capitalize()}")
-        else:
-            captions.append(f"{flattened_captions[i + 1].strip('.?, ').capitalize()}")
+        # random_num = random.random()
+        # if random_num < 0.25:
+        #     captions.append(
+        #         f"{flattened_captions[i].strip('.?, ').capitalize()} and {flattened_captions[i + 1].strip('.?, ')}")
+        # elif 0.25 < random_num < 0.5:
+        #     captions.append(
+        #         f"{flattened_captions[i + 1].strip('.?, ').capitalize()} and {flattened_captions[i].strip('.?, ')}")
+        # elif 0.5 < random_num < 0.75:
+        #     captions.append(f"{flattened_captions[i].strip('.?, ').capitalize()}")
+        # else:
+        #     captions.append(f"{flattened_captions[i + 1].strip('.?, ').capitalize()}")
     return captions
 
 
