@@ -35,18 +35,17 @@ from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
 # LoRA
 from peft import LoraConfig, get_peft_model
 
+from cir_fusion import attach_cir_fusion, compose_query_features, load_cir_fusion, save_cir_fusion
 from data_utils import base_path, squarepad_transform, targetpad_transform, CIRRDataset, FashionIQDataset
-from utils import collate_fn, update_train_running_results, set_train_bar_description, element_wise_sum
+from utils import collate_fn, update_train_running_results, set_train_bar_description
 from clip_ance_utils import (
     CLIPHardNegativeMiner,
-    clamp_logit_scale_,
     compute_clip_ance_loss,
     enable_model_logit_scale_training,
     get_model_logit_scale,
     get_similarity_scale,
     save_model_logit_scale,
     set_model_logit_scale,
-    temperature_bounds_to_logit_scale_bounds,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -121,6 +120,9 @@ def get_clip_model_and_processor(
     lora_alpha: int = 16,
     lora_dropout: float = 0.1,
     init_temperature: Optional[float] = None,
+    fusion_type: str = "adaptive_residual",
+    fusion_hidden_dim: Optional[int] = None,
+    fusion_dropout: float = 0.1,
 ):
     # Map simple names to HF model IDs
     hf_model_name = CLIP_MODEL_MAPPING.get(model_name, model_name)
@@ -154,6 +156,20 @@ def get_clip_model_and_processor(
 
     if init_temperature is not None:
         set_model_logit_scale(model, init_temperature, logger)
+
+    model_source_path = Path(hf_model_name)
+    loaded_fusion = False
+    if model_source_path.exists():
+        loaded_fusion = load_cir_fusion(model, model_source_path, logger)
+    if not loaded_fusion:
+        attach_cir_fusion(
+            model,
+            embedding_dim=embedding_dim,
+            fusion_type=fusion_type,
+            hidden_dim=fusion_hidden_dim,
+            dropout=fusion_dropout,
+            log=logger,
+        )
 
     # Move model to device
     model = model.to(device)
@@ -196,6 +212,7 @@ def extract_clip_index_features(dataset, clip_model, device, batch_size=64, num_
 # =========================================================
 def deepspeed_save_hf_pretrained(
     model_engine,
+    processor: CLIPProcessor,
     tokenizer: CLIPTokenizer,
     save_dir: Path,
     dist_info: dict,
@@ -208,11 +225,21 @@ def deepspeed_save_hf_pretrained(
 
     # Get the underlying model from DeepSpeed engine
     model = model_engine.module
-    
-    # Save using HuggingFace's save_pretrained
-    model.save_pretrained(str(save_dir))
+
+    if hasattr(model, "peft_config"):
+        model.save_pretrained(str(save_dir))
+    else:
+        base_state_dict = {
+            key: value
+            for key, value in model.state_dict().items()
+            if not key.startswith("cir_fusion.")
+        }
+        model.save_pretrained(str(save_dir), state_dict=base_state_dict)
+
+    processor.save_pretrained(str(save_dir))
     tokenizer.save_pretrained(str(save_dir))
     save_model_logit_scale(model, save_dir, logger)
+    save_cir_fusion(model, save_dir, logger)
 
 def deepspeed_save_checkpoint(
     model_engine,
@@ -225,39 +252,42 @@ def deepspeed_save_checkpoint(
 
 def build_trainable_param_groups(
     model,
-    base_learning_rate: float,
-    logit_scale_learning_rate: Optional[float],
-    weight_decay: float,
+    default_learning_rate: float,
+    lora_learning_rate: Optional[float] = None,
+    fusion_learning_rate: Optional[float] = None,
 ):
-    """Create dedicated optimizer groups so logit_scale can use a smaller LR."""
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
-    logit_scale = get_model_logit_scale(model)
-    if logit_scale is None or not logit_scale.requires_grad:
-        return trainable_params
+    """Create optimizer groups so LoRA and CIR fusion can use different learning rates."""
+    lora_lr = float(lora_learning_rate if lora_learning_rate is not None else default_learning_rate)
+    fusion_lr = float(fusion_learning_rate if fusion_learning_rate is not None else default_learning_rate)
+    default_lr = float(default_learning_rate)
 
-    regular_params = [param for param in trainable_params if param is not logit_scale]
-    logit_scale_lr = logit_scale_learning_rate if logit_scale_learning_rate is not None else base_learning_rate * 0.1
+    lora_params = []
+    fusion_params = []
+    other_params = []
 
-    logger.info(
-        f"Using dedicated logit_scale param group: base_lr={base_learning_rate:.2e}, "
-        f"logit_scale_lr={logit_scale_lr:.2e}"
-    )
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("cir_fusion."):
+            fusion_params.append(param)
+        elif "lora_" in name:
+            lora_params.append(param)
+        else:
+            other_params.append(param)
 
     param_groups = []
-    if regular_params:
-        param_groups.append(
-            {
-                "params": regular_params,
-                "lr": base_learning_rate,
-                "weight_decay": weight_decay,
-            }
-        )
-    param_groups.append(
-        {
-            "params": [logit_scale],
-            "lr": logit_scale_lr,
-            "weight_decay": 0.0,
-        }
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": lora_lr})
+    if fusion_params:
+        param_groups.append({"params": fusion_params, "lr": fusion_lr})
+    if other_params:
+        param_groups.append({"params": other_params, "lr": default_lr})
+
+    logger.info(
+        "Optimizer param groups: "
+        f"lora={len(lora_params)} tensors @ {lora_lr:.2e}, "
+        f"fusion={len(fusion_params)} tensors @ {fusion_lr:.2e}, "
+        f"other={len(other_params)} tensors @ {default_lr:.2e}"
     )
     return param_groups
 
@@ -292,7 +322,7 @@ def compute_fiq_val_metrics_clip(relative_val_dataset, clip_model, tokenizer, in
                 text_features = encode_text_hf(clip_model, tokenizer, input_captions, device)
                 reference_features = F.normalize(reference_features, dim=-1)
                 text_features = F.normalize(text_features, dim=-1)
-                batch_predicted = element_wise_sum(reference_features, text_features)
+                batch_predicted = compose_query_features(clip_model, reference_features, text_features)
             predicted_features.append(batch_predicted.cpu())
 
         target_names.extend(batch_target_names)
@@ -335,7 +365,7 @@ def compute_cirr_val_metrics_clip(relative_val_dataset, clip_model, tokenizer, i
                 text_features = encode_text_hf(clip_model, tokenizer, captions, device)
                 reference_features = F.normalize(reference_features, dim=-1)
                 text_features = F.normalize(text_features, dim=-1)
-                batch_predicted = element_wise_sum(reference_features, text_features)
+                batch_predicted = compose_query_features(clip_model, reference_features, text_features)
             predicted_features.append(batch_predicted.cpu())
 
         reference_names.extend(batch_reference_names)
@@ -405,11 +435,11 @@ def clip_finetune_fiq_ance(
     assert dist_info is not None
     device = torch.device(f"cuda:{dist_info['local_rank']}") if torch.cuda.is_available() else torch.device("cpu")
     init_temperature = kwargs.get("init_temperature")
-    min_temperature = kwargs.get("min_temperature", 0.01)
-    max_temperature = kwargs.get("max_temperature", 0.07)
-    logit_scale_lr = kwargs.get("logit_scale_lr")
-    logit_scale_warmup_epochs = kwargs.get("logit_scale_warmup_epochs", 0)
-    _, max_logit_scale = temperature_bounds_to_logit_scale_bounds(min_temperature, max_temperature)
+    fusion_type = kwargs.get("fusion_type", "adaptive_residual")
+    fusion_hidden_dim = kwargs.get("fusion_hidden_dim")
+    fusion_dropout = kwargs.get("fusion_dropout", 0.1)
+    lora_learning_rate = kwargs.get("lora_learning_rate", 5e-5)
+    fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -432,6 +462,9 @@ def clip_finetune_fiq_ance(
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         init_temperature=init_temperature,
+        fusion_type=fusion_type,
+        fusion_hidden_dim=fusion_hidden_dim,
+        fusion_dropout=fusion_dropout,
     )
 
     # Save hyperparameters (rank0 only)
@@ -453,13 +486,13 @@ def clip_finetune_fiq_ance(
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
+            "fusion_type": fusion_type,
+            "fusion_hidden_dim": fusion_hidden_dim,
+            "fusion_dropout": fusion_dropout,
+            "lora_learning_rate": lora_learning_rate,
+            "fusion_learning_rate": fusion_learning_rate,
             "learnable_temperature": True,
             "init_temperature": init_temperature,
-            "min_temperature": min_temperature,
-            "max_temperature": max_temperature,
-            "logit_scale_lr": logit_scale_lr if logit_scale_lr is not None else learning_rate * 0.1,
-            "logit_scale_warmup_epochs": logit_scale_warmup_epochs,
-            "max_logit_scale": float(np.exp(max_logit_scale)),
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
@@ -548,13 +581,13 @@ def clip_finetune_fiq_ance(
     # Update optimizer lr
     if "optimizer" in ds_config and "params" in ds_config["optimizer"]:
         ds_config["optimizer"]["params"]["lr"] = learning_rate
-    optimizer_weight_decay = ds_config.get("optimizer", {}).get("params", {}).get("weight_decay", 0.0)
     model_parameters = build_trainable_param_groups(
         clip_model,
-        base_learning_rate=learning_rate,
-        logit_scale_learning_rate=logit_scale_lr,
-        weight_decay=optimizer_weight_decay,
+        default_learning_rate=learning_rate,
+        lora_learning_rate=lora_learning_rate,
+        fusion_learning_rate=fusion_learning_rate,
     )
+    max_lrs = [group.get("lr", learning_rate) for group in model_parameters]
     
     # Initialize DeepSpeed with model and optimizer
     model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -563,13 +596,12 @@ def clip_finetune_fiq_ance(
         config=ds_config,
     )
     train_logit_scale = get_model_logit_scale(model_engine.module)
-    clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
     # Create scheduler manually (DeepSpeed's OneCycle scheduler has limited flexibility)
     # We'll use PyTorch's OneCycleLR instead
     scheduler = OneCycleLR(
         optimizer.optimizer,  # Access underlying optimizer from DeepSpeed
-        max_lr=learning_rate,
+        max_lr=max_lrs,
         pct_start=1.5 / num_epochs,
         div_factor=100.0,
         steps_per_epoch=len(relative_train_loader) // grad_accum_steps,
@@ -585,11 +617,6 @@ def clip_finetune_fiq_ance(
     for epoch in range(num_epochs):
         if dist_info["enabled"]:
             train_sampler.set_epoch(epoch)
-
-        if train_logit_scale is not None:
-            train_logit_scale.requires_grad_(epoch >= logit_scale_warmup_epochs)
-            if epoch == logit_scale_warmup_epochs and is_main_process(dist_info):
-                logger.info(f"Enabled logit_scale updates at epoch {epoch}")
 
         # Refresh ANCE index periodically
         if epoch > 0 and use_ance:
@@ -631,7 +658,7 @@ def clip_finetune_fiq_ance(
             ref_features = F.normalize(ref_features, dim=-1)
             target_features = F.normalize(target_features, dim=-1)
             text_features = F.normalize(text_features, dim=-1)
-            query_features = element_wise_sum(ref_features, text_features)
+            query_features = compose_query_features(model_engine.module, ref_features, text_features)
 
             hard_negative_names = None
             hard_neg_indices = None
@@ -704,10 +731,9 @@ def clip_finetune_fiq_ance(
                     partial_intent_negative_features=partial_intent_negative_features,
                     partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
                     logit_scale=train_logit_scale,
-                    max_logit_scale=max_logit_scale,
                 )
             else:
-                scale = get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale)
+                scale = get_similarity_scale(logit_scale=train_logit_scale)
                 sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
                 labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
                 loss = F.cross_entropy(sim_matrix, labels)
@@ -715,7 +741,6 @@ def clip_finetune_fiq_ance(
             # DeepSpeed handles backward, gradient accumulation, and optimizer step
             model_engine.backward(loss)
             model_engine.step()
-            clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
             # Step scheduler at the right frequency
             if (step + 1) % grad_accum_steps == 0:
@@ -734,7 +759,7 @@ def clip_finetune_fiq_ance(
         if is_main_process(dist_info):
             avg_loss = (total_loss.item() / max(int(total_imgs.item()), 1))
             current_temperature = 1.0 / float(
-                get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale).detach().cpu().item()
+                get_similarity_scale(logit_scale=train_logit_scale).detach().cpu().item()
             )
             loss_log_dict = {"epoch": epoch, "loss": avg_loss, "temperature": current_temperature}
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
@@ -779,18 +804,18 @@ def clip_finetune_fiq_ance(
 
                 if save_training and save_best and results_dict["average_recall"] > best_avg_recall:
                     best_avg_recall = results_dict["average_recall"]
-                    deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "best_model", dist_info)
+                    deepspeed_save_hf_pretrained(model_engine, processor, tokenizer, training_path / "best_model", dist_info)
                     logger.info(f"Saved best model at epoch {epoch} with recall {best_avg_recall:.2f}")
 
             if save_training:
-                deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "latest_model", dist_info)
+                deepspeed_save_hf_pretrained(model_engine, processor, tokenizer, training_path / "latest_model", dist_info)
                 if is_main_process(dist_info):
                     logger.info(f"Saved latest model at epoch {epoch}")
 
             barrier(dist_info)
 
     if save_training:
-        deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "final_model", dist_info)
+        deepspeed_save_hf_pretrained(model_engine, processor, tokenizer, training_path / "final_model", dist_info)
         if is_main_process(dist_info):
             logger.info(f"Saved final model to {training_path / 'final_model'}")
     barrier(dist_info)
@@ -824,11 +849,11 @@ def clip_finetune_cirr_ance(
     assert dist_info is not None
     device = torch.device(f"cuda:{dist_info['local_rank']}") if torch.cuda.is_available() else torch.device("cpu")
     init_temperature = kwargs.get("init_temperature")
-    min_temperature = kwargs.get("min_temperature", 0.01)
-    max_temperature = kwargs.get("max_temperature", 0.07)
-    logit_scale_lr = kwargs.get("logit_scale_lr")
-    logit_scale_warmup_epochs = kwargs.get("logit_scale_warmup_epochs", 0)
-    _, max_logit_scale = temperature_bounds_to_logit_scale_bounds(min_temperature, max_temperature)
+    fusion_type = kwargs.get("fusion_type", "adaptive_residual")
+    fusion_hidden_dim = kwargs.get("fusion_hidden_dim")
+    fusion_dropout = kwargs.get("fusion_dropout", 0.1)
+    lora_learning_rate = kwargs.get("lora_learning_rate", 5e-5)
+    fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -850,6 +875,9 @@ def clip_finetune_cirr_ance(
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         init_temperature=init_temperature,
+        fusion_type=fusion_type,
+        fusion_hidden_dim=fusion_hidden_dim,
+        fusion_dropout=fusion_dropout,
     )
 
     if is_main_process(dist_info):
@@ -870,13 +898,13 @@ def clip_finetune_cirr_ance(
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
+            "fusion_type": fusion_type,
+            "fusion_hidden_dim": fusion_hidden_dim,
+            "fusion_dropout": fusion_dropout,
+            "lora_learning_rate": lora_learning_rate,
+            "fusion_learning_rate": fusion_learning_rate,
             "learnable_temperature": True,
             "init_temperature": init_temperature,
-            "min_temperature": min_temperature,
-            "max_temperature": max_temperature,
-            "logit_scale_lr": logit_scale_lr if logit_scale_lr is not None else learning_rate * 0.1,
-            "logit_scale_warmup_epochs": logit_scale_warmup_epochs,
-            "max_logit_scale": float(np.exp(max_logit_scale)),
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
@@ -957,13 +985,13 @@ def clip_finetune_cirr_ance(
     
     if "optimizer" in ds_config and "params" in ds_config["optimizer"]:
         ds_config["optimizer"]["params"]["lr"] = learning_rate
-    optimizer_weight_decay = ds_config.get("optimizer", {}).get("params", {}).get("weight_decay", 0.0)
     model_parameters = build_trainable_param_groups(
         clip_model,
-        base_learning_rate=learning_rate,
-        logit_scale_learning_rate=logit_scale_lr,
-        weight_decay=optimizer_weight_decay,
+        default_learning_rate=learning_rate,
+        lora_learning_rate=lora_learning_rate,
+        fusion_learning_rate=fusion_learning_rate,
     )
+    max_lrs = [group.get("lr", learning_rate) for group in model_parameters]
     
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=clip_model,
@@ -971,11 +999,10 @@ def clip_finetune_cirr_ance(
         config=ds_config,
     )
     train_logit_scale = get_model_logit_scale(model_engine.module)
-    clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
     scheduler = OneCycleLR(
         optimizer.optimizer,
-        max_lr=learning_rate,
+        max_lr=max_lrs,
         pct_start=1/50,
         steps_per_epoch=len(relative_train_loader) // grad_accum_steps,
         epochs=num_epochs
@@ -990,11 +1017,6 @@ def clip_finetune_cirr_ance(
     for epoch in range(num_epochs):
         if dist_info["enabled"]:
             train_sampler.set_epoch(epoch)
-
-        if train_logit_scale is not None:
-            train_logit_scale.requires_grad_(epoch >= logit_scale_warmup_epochs)
-            if epoch == logit_scale_warmup_epochs and is_main_process(dist_info):
-                logger.info(f"Enabled logit_scale updates at epoch {epoch}")
 
         # Refresh ANCE index periodically
         if epoch > 0 and use_ance:
@@ -1030,7 +1052,7 @@ def clip_finetune_cirr_ance(
             target_features = F.normalize(target_features, dim=-1)
             text_features = F.normalize(text_features, dim=-1)
 
-            query_features = element_wise_sum(ref_features, text_features)
+            query_features = compose_query_features(model_engine.module, ref_features, text_features)
 
             hard_negative_names = None
             hard_neg_indices = None
@@ -1102,17 +1124,15 @@ def clip_finetune_cirr_ance(
                     partial_intent_negative_features=partial_intent_negative_features,
                     partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
                     logit_scale=train_logit_scale,
-                    max_logit_scale=max_logit_scale,
                 )
             else:
-                scale = get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale)
+                scale = get_similarity_scale(logit_scale=train_logit_scale)
                 sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
                 labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
                 loss = F.cross_entropy(sim_matrix, labels)
 
             model_engine.backward(loss)
             model_engine.step()
-            clamp_logit_scale_(train_logit_scale, min_temperature=min_temperature, max_temperature=max_temperature)
 
             if (step + 1) % grad_accum_steps == 0:
                 scheduler.step()
@@ -1129,7 +1149,7 @@ def clip_finetune_cirr_ance(
         if is_main_process(dist_info):
             avg_loss = (total_loss.item() / max(int(total_imgs.item()), 1))
             current_temperature = 1.0 / float(
-                get_similarity_scale(logit_scale=train_logit_scale, max_logit_scale=max_logit_scale).detach().cpu().item()
+                get_similarity_scale(logit_scale=train_logit_scale).detach().cpu().item()
             )
             loss_log_dict = {"epoch": epoch, "loss": avg_loss, "temperature": current_temperature}
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
@@ -1173,18 +1193,18 @@ def clip_finetune_cirr_ance(
 
                 if save_training and save_best and results_dict["arithmetic_mean"] > best_arithmetic:
                     best_arithmetic = results_dict["arithmetic_mean"]
-                    deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "best_model", dist_info)
+                    deepspeed_save_hf_pretrained(model_engine, processor, tokenizer, training_path / "best_model", dist_info)
                     logger.info(f"Saved best model at epoch {epoch} with arithmetic mean {best_arithmetic:.2f}")
 
             if save_training:
-                deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "latest_model", dist_info)
+                deepspeed_save_hf_pretrained(model_engine, processor, tokenizer, training_path / "latest_model", dist_info)
                 if is_main_process(dist_info):
                     logger.info(f"Saved latest model at epoch {epoch}")
 
             barrier(dist_info)
 
     if save_training:
-        deepspeed_save_hf_pretrained(model_engine, tokenizer, training_path / "final_model", dist_info)
+        deepspeed_save_hf_pretrained(model_engine, processor, tokenizer, training_path / "final_model", dist_info)
         if is_main_process(dist_info):
             logger.info(f"Saved final model to {training_path / 'final_model'}")
     barrier(dist_info)
@@ -1202,7 +1222,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--num-epochs", default=100, type=int)
     parser.add_argument("--clip-model-name", default="ViT-B/32", type=str)
-    parser.add_argument("--learning-rate", default=2e-6, type=float)
+    parser.add_argument("--learning-rate", default=5e-5, type=float)
     parser.add_argument("--batch-size", default=128, type=int)  # per-GPU
     parser.add_argument("--validation-frequency", default=1, type=int)
     parser.add_argument("--target-ratio", default=1.25, type=float)
@@ -1217,7 +1237,7 @@ if __name__ == "__main__":
     parser.add_argument("--ance-refresh-interval", default=1, type=int)
     parser.add_argument("--ance-weight", default=1.0, type=float)
     parser.add_argument("--ance-warmup-epochs", default=0, type=int)
-    parser.add_argument("--ref-ance-weight", default=0.5, type=float)
+    parser.add_argument("--ref-ance-weight", default=1.0, type=float)
     parser.add_argument("--partial-intent-num-negatives", default=None, type=int)
     parser.add_argument("--partial-intent-weight", default=0.75, type=float)
     parser.add_argument("--partial-intent-queries-path", type=str, default=None,
@@ -1229,15 +1249,13 @@ if __name__ == "__main__":
     parser.add_argument("--lora-alpha", default=16, type=int)
     parser.add_argument("--lora-dropout", default=0.1, type=float)
     parser.add_argument("--init-temperature", default=0.03, type=float,
-                        help="Reset CLIP temperature before training. Lower is sharper.")
-    parser.add_argument("--min-temperature", default=0.01, type=float,
-                        help="Smallest allowed temperature during training.")
-    parser.add_argument("--max-temperature", default=0.07, type=float,
-                        help="Largest allowed temperature during training.")
-    parser.add_argument("--logit-scale-lr", default=None, type=float,
-                        help="Optional dedicated learning rate for CLIP logit_scale.")
-    parser.add_argument("--logit-scale-warmup-epochs", default=1, type=int,
-                        help="Freeze logit_scale updates for the first N epochs.")
+                        help="Initial value for the learnable CLIP temperature.")
+    parser.add_argument("--fusion-type", default="adaptive_residual", type=str,
+                        choices=["sum", "adaptive_residual"])
+    parser.add_argument("--fusion-hidden-dim", default=None, type=int)
+    parser.add_argument("--fusion-dropout", default=0.1, type=float)
+    parser.add_argument("--lora-learning-rate", default=5e-5, type=float)
+    parser.add_argument("--fusion-learning-rate", default=1e-4, type=float)
     parser.add_argument("--seed", default=41, type=int)
 
     # DeepSpeed
@@ -1283,12 +1301,13 @@ if __name__ == "__main__":
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
+        "fusion_type": args.fusion_type,
+        "fusion_hidden_dim": args.fusion_hidden_dim,
+        "fusion_dropout": args.fusion_dropout,
+        "lora_learning_rate": args.lora_learning_rate,
+        "fusion_learning_rate": args.fusion_learning_rate,
         "learnable_temperature": True,
         "init_temperature": args.init_temperature,
-        "min_temperature": args.min_temperature,
-        "max_temperature": args.max_temperature,
-        "logit_scale_lr": args.logit_scale_lr,
-        "logit_scale_warmup_epochs": args.logit_scale_warmup_epochs,
         "seed": args.seed,
         # DeepSpeed
         "dist_info": dist_info,

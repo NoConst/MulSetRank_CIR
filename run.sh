@@ -51,49 +51,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_anc
     --batch-size 8 \
     --num-epochs 20 \
     --learning-rate 5e-5 \
+    --lora-learning-rate 5e-5 \
+    --fusion-learning-rate 3e-5 \
     --ance-num-negatives 3 \
     --use-lora \
     --ance-warmup-epochs 0 \
     --lora-r 16 \
     --lora-alpha 32 \
     --init-temperature 0.03 \
-    --logit-scale-lr 5e-6 \
     --save-training \
     --save-best \
     --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
-    --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_fiq_H_14_partial_intent.log &
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_fusion_ance_train.py \
-  --dataset fashioniq \
-  --clip-model-name "ViT-H/14" \
-  --pretrained-clip-path models/clip_ance_fiq_ViT-H-14_lora_2026-03-07_13:43:47/best_model \
-  --deepspeed-config ds_config_zero2.json \
-  --ance-num-negatives 3 \
-  --num-cross-attn-layers 4 \
-  --num-heads 8 \
-  --num-aux-tokens 4 \
-  --num-epochs 50 \
-  --batch-size 128 \
-  --learning-rate 2e-4 \
-  --ance-warmup-epochs 0 \
-  --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
-  --save-training --save-best > deepspeed_clip_bicross_fusion_fiq_H_14.log 2>&1 &
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 --master_port=29604 src/deepspeed_clip_fusion_ance_train.py \
-  --dataset fashioniq \
-  --clip-model-name "ViT-H/14" \
-  --pretrained-clip-path models/clip_ance_fiq_ViT-H-14_lora_2026-03-07_13:43:47/best_model \
-  --deepspeed-config ds_config_zero2.json \
-  --ance-num-negatives 3 \
-  --fusion-type mlp_residual \
-  --mlp-hidden-mult 2.0 \
-  --num-epochs 50 \
-  --batch-size 128 \
-  --learning-rate 1e-4 \
-  --ance-warmup-epochs 0 \
-  --experiment-name mlp_residual_h2 \
-  --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
-  --save-training --save-best > deepspeed_clip_mlp_fusion_fiq_H_14_neg_6_h2.log 2>&1 &
+    --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_fiq_H_14_partial_intent_lora5e-5_fusion1e-4.log &
 
 
 

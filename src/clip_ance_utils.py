@@ -4,7 +4,8 @@ CLIP-based ANCE (Approximate Nearest Neighbor Negative Contrastive Estimation) u
 for hard negative sampling in Composed Image Retrieval training.
 
 This module provides hard negative mining capabilities for CLIP-based CIR models,
-where the composed query is the element-wise sum of text and image features.
+where the composed query can be a learned fusion head or the element-wise sum
+fallback of text and image features.
 
 Uses Hugging Face Transformers CLIP models.
 Pure PyTorch implementation without FAISS dependency.
@@ -15,36 +16,32 @@ import os
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Tuple, List, Optional, Union
+from typing import List, Optional, Tuple, Union
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from pathlib import Path
 import logging
 from transformers import CLIPModel, CLIPProcessor
 
+from cir_fusion import compose_query_features
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DEFAULT_CLIP_TEMPERATURE = 0.07
-MAX_LOGIT_SCALE = float(np.log(100.0))
 LOGIT_SCALE_STATE_FILENAME = "logit_scale.pt"
 
 
 def get_similarity_scale(
-    temperature: float = DEFAULT_CLIP_TEMPERATURE,
-    logit_scale: Optional[torch.Tensor] = None,
-    max_logit_scale: float = MAX_LOGIT_SCALE,
+    logit_scale: Union[torch.Tensor, float],
 ):
     """Return the multiplicative similarity scale used by CLIP-style losses."""
-    if logit_scale is not None:
-        if not isinstance(logit_scale, torch.Tensor):
-            logit_scale = torch.tensor(logit_scale, dtype=torch.float32)
-        return logit_scale.float().clamp(max=max_logit_scale).exp()
+    if logit_scale is None:
+        raise ValueError("logit_scale is required.")
 
-    if isinstance(temperature, torch.Tensor):
-        return temperature.float().reciprocal()
+    if isinstance(logit_scale, torch.Tensor):
+        return logit_scale.float().exp()
 
-    return 1.0 / float(temperature)
+    return float(np.exp(float(logit_scale)))
 
 
 def get_model_logit_scale(model) -> Optional[torch.Tensor]:
@@ -66,29 +63,12 @@ def get_model_logit_scale(model) -> Optional[torch.Tensor]:
     return None
 
 
-def temperature_bounds_to_logit_scale_bounds(
-    min_temperature: float,
-    max_temperature: float,
-) -> Tuple[float, float]:
-    """Convert temperature bounds to logit_scale bounds."""
-    min_temperature = float(min_temperature)
-    max_temperature = float(max_temperature)
-    if min_temperature <= 0 or max_temperature <= 0:
-        raise ValueError("Temperature bounds must be positive.")
-    if min_temperature > max_temperature:
-        raise ValueError("min_temperature must be <= max_temperature.")
-
-    min_logit_scale = float(np.log(1.0 / max_temperature))
-    max_logit_scale = float(np.log(1.0 / min_temperature))
-    return min_logit_scale, max_logit_scale
-
-
 def enable_model_logit_scale_training(model, log: Optional[logging.Logger] = None) -> Optional[torch.Tensor]:
     """Ensure logit_scale stays trainable even when PEFT freezes base parameters."""
     logit_scale = get_model_logit_scale(model)
     if logit_scale is None:
         if log is not None:
-            log.warning("Could not find CLIP logit_scale parameter; fixed temperature fallback will be used.")
+            log.warning("Could not find CLIP logit_scale parameter.")
         return None
 
     logit_scale.requires_grad_(True)
@@ -122,24 +102,6 @@ def set_model_logit_scale(
     if log is not None:
         log.info(f"Reset logit_scale to temperature={float(temperature):.4f}")
 
-    return logit_scale
-
-
-def clamp_logit_scale_(
-    logit_scale: Optional[torch.Tensor],
-    min_temperature: float,
-    max_temperature: float,
-) -> Optional[torch.Tensor]:
-    """Clamp logit_scale in-place using temperature bounds."""
-    if logit_scale is None:
-        return None
-
-    min_logit_scale, max_logit_scale = temperature_bounds_to_logit_scale_bounds(
-        min_temperature=min_temperature,
-        max_temperature=max_temperature,
-    )
-    with torch.no_grad():
-        logit_scale.clamp_(min=min_logit_scale, max=max_logit_scale)
     return logit_scale
 
 
@@ -514,7 +476,7 @@ class CLIPHardNegativeMiner:
                         part_text_features = F.normalize(part_text_features, dim=-1)
                 
                 # 与ref_features组合
-                part_query = F.normalize(ref_features[i:i+1] + part_text_features, dim=-1)
+                part_query = compose_query_features(clip_model, ref_features[i:i+1], part_text_features)
                 
                 # 搜索top-k候选
                 _, topk_indices = self._search_topk(part_query, self.topk_candidates)
@@ -674,7 +636,7 @@ class CLIPHardNegativeMiner:
             partial_text_features = clip_model.get_text_features(**inputs)
             partial_text_features = F.normalize(partial_text_features, dim=-1)
 
-        partial_query = F.normalize(ref_features + partial_text_features, dim=-1)
+        partial_query = compose_query_features(clip_model, ref_features, partial_text_features)
 
         _, topk_indices = self._search_topk(partial_query, self.topk_candidates)
 
@@ -767,7 +729,7 @@ class CLIPHardNegativeMiner:
             text_features = clip_model.get_text_features(**inputs)
             text_features = F.normalize(text_features, dim=-1)
 
-        query = F.normalize(ref_features + text_features, dim=-1)
+        query = compose_query_features(clip_model, ref_features, text_features)
 
         _, topk_indices = self._search_topk(query, self.topk_candidates)
 
@@ -808,20 +770,14 @@ class CLIPHardNegativeMiner:
 def contrastive_in_batch_loss(
     query,
     target,
-    temperature=DEFAULT_CLIP_TEMPERATURE,
     normalized=False,
-    logit_scale: Optional[torch.Tensor] = None,
-    max_logit_scale: float = MAX_LOGIT_SCALE,
+    logit_scale: Optional[Union[torch.Tensor, float]] = None,
 ):
     """In-batch contrastive loss."""
     if not normalized:
         query = F.normalize(query, dim=-1)
         target = F.normalize(target, dim=-1)
-    scale = get_similarity_scale(
-        temperature=temperature,
-        logit_scale=logit_scale,
-        max_logit_scale=max_logit_scale,
-    )
+    scale = get_similarity_scale(logit_scale=logit_scale)
     sim = torch.matmul(query.float(), target.float().T) * scale
     labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device)
     return F.cross_entropy(sim, labels)
@@ -831,10 +787,8 @@ def contrastive_loss_hard_negative(
     query,
     positive,
     negatives,
-    temperature=DEFAULT_CLIP_TEMPERATURE,
     normalized=False,
-    logit_scale: Optional[torch.Tensor] = None,
-    max_logit_scale: float = MAX_LOGIT_SCALE,
+    logit_scale: Optional[Union[torch.Tensor, float]] = None,
 ):
     """Contrastive loss with hard negatives."""
     if not normalized:
@@ -842,11 +796,7 @@ def contrastive_loss_hard_negative(
         positive = F.normalize(positive, dim=-1)
         negatives = F.normalize(negatives, dim=-1)
 
-    scale = get_similarity_scale(
-        temperature=temperature,
-        logit_scale=logit_scale,
-        max_logit_scale=max_logit_scale,
-    )
+    scale = get_similarity_scale(logit_scale=logit_scale)
     pos_sim = torch.sum(query.float() * positive.float(), dim=-1, keepdim=True)
     neg_sim = torch.bmm(query.float().unsqueeze(1), negatives.float().transpose(1, 2)).squeeze(1)
     logits = torch.cat([pos_sim, neg_sim], dim=1) * scale
@@ -869,10 +819,8 @@ def compute_local_ranking_loss(query_feat, target_feat, hard_neg_feats, margin=0
 def compute_listwise_ranking_loss(
     query_features: torch.Tensor,
     negative_features_list: List[torch.Tensor],
-    temperature: float = 0.1,
     ranking_weights: Optional[List[float]] = None,
-    logit_scale: Optional[torch.Tensor] = None,
-    max_logit_scale: float = MAX_LOGIT_SCALE,
+    logit_scale: Optional[Union[torch.Tensor, float]] = None,
 ) -> torch.Tensor:
     """
     使用 Listwise 排序来形成负样本之间的偏序
@@ -881,7 +829,6 @@ def compute_listwise_ranking_loss(
         query_features: [B, D] query features
         negative_features_list: List of negative feature tensors, each [B, N_i, D]
                                 按照期望的排序顺序排列（例如：[hard, text_intent, ref_hard]）
-        temperature: temperature for softmax
         ranking_weights: Optional weights for each negative type, default is [1.0, 0.8, 0.6, ...]
     
     Returns:
@@ -914,11 +861,7 @@ def compute_listwise_ranking_loss(
     # 相似度越高，排名应该越高，softmax 会放大较大的值，所以直接使用 sim
     
     # 使用温度缩放
-    scale = get_similarity_scale(
-        temperature=temperature,
-        logit_scale=logit_scale,
-        max_logit_scale=max_logit_scale,
-    )
+    scale = get_similarity_scale(logit_scale=logit_scale)
     logits = all_sim.float() * scale
     
     # 构建目标概率分布
@@ -955,14 +898,12 @@ def compute_clip_ance_loss(
     query_features: torch.Tensor,
     target_features: torch.Tensor,
     hard_negative_features: torch.Tensor,
-    temperature: float = DEFAULT_CLIP_TEMPERATURE,
     hard_negative_weight: float = 1.0,
     ref_hard_negative_features: Optional[torch.Tensor] = None,
     ref_hard_negative_weight: float = 1.0,
     partial_intent_negative_features: Optional[torch.Tensor] = None,
     partial_intent_negative_weight: float = 0.75,
-    logit_scale: Optional[torch.Tensor] = None,
-    max_logit_scale: float = MAX_LOGIT_SCALE,
+    logit_scale: Optional[Union[torch.Tensor, float]] = None,
     **legacy_kwargs,
 ) -> torch.Tensor:
     """Compute ANCE-style contrastive loss with three-level negatives."""
@@ -1004,11 +945,7 @@ def compute_clip_ance_loss(
     
     # In-batch loss
     if target_features.dim() == 3:
-        scale = get_similarity_scale(
-            temperature=temperature,
-            logit_scale=logit_scale,
-            max_logit_scale=max_logit_scale,
-        )
+        scale = get_similarity_scale(logit_scale=logit_scale)
         # query: (B,D), target: (B,Q,D) -> sim matrix (B,B) using max over Q
         sim = torch.einsum("id,jqd->ijq", query_features.float(), target_features.float()).max(dim=-1).values
         sim = sim * scale
@@ -1018,19 +955,13 @@ def compute_clip_ance_loss(
         loss_in_batch = contrastive_in_batch_loss(
             query_features,
             target_features,
-            temperature,
             normalized=True,
             logit_scale=logit_scale,
-            max_logit_scale=max_logit_scale,
         )
 
     # Hard negative loss
     if target_features.dim() == 3:
-        scale = get_similarity_scale(
-            temperature=temperature,
-            logit_scale=logit_scale,
-            max_logit_scale=max_logit_scale,
-        )
+        scale = get_similarity_scale(logit_scale=logit_scale)
         # Positive similarity per sample: max over Q
         sim_pos = torch.einsum("id,iqd->iq", query_features.float(), target_features.float()).max(dim=-1).values
         # Neg similarities: (B,N)
@@ -1046,10 +977,8 @@ def compute_clip_ance_loss(
             query_features,
             target_features,
             hard_neg_tensor,
-            temperature,
             normalized=True,
             logit_scale=logit_scale,
-            max_logit_scale=max_logit_scale,
         )
 
     batch_size, num_negatives, dim = hard_neg_tensor.shape
@@ -1058,9 +987,7 @@ def compute_clip_ance_loss(
     loss_hard_in_batch = contrastive_in_batch_loss(
         query_repeated,
         hard_neg_flat,
-        temperature,
         logit_scale=logit_scale,
-        max_logit_scale=max_logit_scale,
     )
 
     total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative + loss_hard_in_batch
@@ -1075,10 +1002,8 @@ def compute_clip_ance_loss(
             query_features,
             target_features,
             partial_intent_neg_tensor,
-            temperature,
             normalized=True,
             logit_scale=logit_scale,
-            max_logit_scale=max_logit_scale,
         )
         total_loss = total_loss + partial_intent_negative_weight * loss_partial_intent
     
@@ -1108,10 +1033,8 @@ def compute_clip_ance_loss(
         listwise_loss = compute_listwise_ranking_loss(
             query_features=query_features,
             negative_features_list=negative_features_list,
-            temperature=0.1,
             ranking_weights=ranking_weights,
             logit_scale=logit_scale,
-            max_logit_scale=max_logit_scale,
         )
         total_loss = total_loss + listwise_loss
     
