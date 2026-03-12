@@ -278,6 +278,25 @@ class FashionIQDataset(Dataset):
                 images = list(executor.map(self.get_image_by_name, image_names))
         
         return torch.stack(images)
+    
+    def get_images_batch(self, image_names: List[str]) -> torch.Tensor:
+        """
+        高效批量获取图像 - 针对预加载模式优化。
+        当图像已预加载到内存时，直接从缓存获取，避免ThreadPoolExecutor开销。
+        
+        Args:
+            image_names: List of image names
+            
+        Returns:
+            Stacked tensor of preprocessed images [N, C, H, W]
+        """
+        if self.preload_images and self.image_cache:
+            # 🚀 快速路径：直接从缓存获取，无额外开销
+            images = [self.image_cache[name] for name in image_names]
+        else:
+            # 回退到标准方法
+            images = [self.get_image_by_name(name) for name in image_names]
+        return torch.stack(images)
 
 
 class CIRRDataset(Dataset):
@@ -441,6 +460,22 @@ class CIRRDataset(Dataset):
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 images = list(executor.map(self.get_image_by_name, image_names))
         
+        return torch.stack(images)
+    
+    def get_images_batch(self, image_names: List[str]) -> torch.Tensor:
+        """
+        高效批量获取图像 - 针对预加载模式优化。
+        
+        Args:
+            image_names: List of image names
+            
+        Returns:
+            Stacked tensor of preprocessed images [N, C, H, W]
+        """
+        if self.preload_images and self.image_cache:
+            images = [self.image_cache[name] for name in image_names]
+        else:
+            images = [self.get_image_by_name(name) for name in image_names]
         return torch.stack(images)
 
 
