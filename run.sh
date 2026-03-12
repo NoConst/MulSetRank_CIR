@@ -52,13 +52,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_anc
     --num-epochs 20 \
     --learning-rate 5e-5 \
     --lora-learning-rate 5e-5 \
-    --fusion-learning-rate 3e-5 \
+    --fusion-learning-rate 2e-5 \
     --ance-num-negatives 3 \
     --use-lora \
     --ance-warmup-epochs 0 \
     --lora-r 16 \
     --lora-alpha 32 \
-    --init-temperature 0.03 \
+    --init-temperature 0.05 \
     --save-training \
     --save-best \
     --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
