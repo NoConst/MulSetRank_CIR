@@ -123,6 +123,7 @@ def get_clip_model_and_processor(
     fusion_type: str = "adaptive_residual",
     fusion_hidden_dim: Optional[int] = None,
     fusion_dropout: float = 0.1,
+    gradient_checkpointing: bool = False,
 ):
     # Map simple names to HF model IDs
     hf_model_name = CLIP_MODEL_MAPPING.get(model_name, model_name)
@@ -170,6 +171,20 @@ def get_clip_model_and_processor(
             dropout=fusion_dropout,
             log=logger,
         )
+
+    if gradient_checkpointing:
+        if use_lora and hasattr(model, "enable_input_require_grads"):
+            try:
+                model.enable_input_require_grads()
+            except NotImplementedError:
+                logger.warning(
+                    "Skipping enable_input_require_grads(): CLIPModel does not expose get_input_embeddings()."
+                )
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            logger.info("Enabled gradient checkpointing for CLIP model")
+        else:
+            logger.warning("Gradient checkpointing requested, but this model does not support it")
 
     # Move model to device
     model = model.to(device)
@@ -419,7 +434,6 @@ def clip_finetune_fiq_ance(
     ance_topk_candidates: int = 100,
     ance_refresh_interval: int = 1,
     ance_weight: float = 1.0,
-    ance_warmup_epochs: int = 0,
     experiment_name: str = None,
     use_lora: bool = False,
     lora_r: int = 8,
@@ -440,6 +454,8 @@ def clip_finetune_fiq_ance(
     fusion_dropout = kwargs.get("fusion_dropout", 0.1)
     lora_learning_rate = kwargs.get("lora_learning_rate", 5e-5)
     fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
+    gradient_checkpointing = kwargs.get("gradient_checkpointing", True)
+    ance_index_device = kwargs.get("ance_index_device", "cpu")
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -465,6 +481,7 @@ def clip_finetune_fiq_ance(
         fusion_type=fusion_type,
         fusion_hidden_dim=fusion_hidden_dim,
         fusion_dropout=fusion_dropout,
+        gradient_checkpointing=gradient_checkpointing,
     )
 
     # Save hyperparameters (rank0 only)
@@ -481,7 +498,7 @@ def clip_finetune_fiq_ance(
             "ance_topk_candidates": ance_topk_candidates,
             "ance_refresh_interval": ance_refresh_interval,
             "ance_weight": ance_weight,
-            "ance_warmup_epochs": ance_warmup_epochs,
+            "listwise_weight": kwargs.get("listwise_weight", 0.2),
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -493,6 +510,8 @@ def clip_finetune_fiq_ance(
             "fusion_learning_rate": fusion_learning_rate,
             "learnable_temperature": True,
             "init_temperature": init_temperature,
+            "gradient_checkpointing": gradient_checkpointing,
+            "ance_index_device": ance_index_device,
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
@@ -516,8 +535,7 @@ def clip_finetune_fiq_ance(
         classic_val_datasets.append(FashionIQDataset("val", [dress_type], "classic", preprocess))
 
     relative_train_dataset = FashionIQDataset("train", train_dress_types, "relative", preprocess)
-    use_ance_init = num_epochs >= ance_warmup_epochs
-    classic_train_dataset = FashionIQDataset("train", train_dress_types, "classic", preprocess, preload_images=use_ance_init)
+    classic_train_dataset = FashionIQDataset("train", train_dress_types, "classic", preprocess, preload_images=True)
 
     # Load partial intent queries for partial intent negative mining
     partial_intent_queries = None
@@ -552,19 +570,18 @@ def clip_finetune_fiq_ance(
         num_negatives=ance_num_negatives,
         topk_candidates=ance_topk_candidates,
         refresh_interval=ance_refresh_interval,
-        use_gpu=True,
+        use_gpu=ance_index_device == "cuda",
         cache_dir=str(training_path / "ance_cache")
     )
 
     logger.info("Building initial embedding index...")
-    if use_ance_init:
-        hard_negative_miner.build_index(
-            clip_model=clip_model,
-            dataset=classic_train_dataset,
-            device=device,
-            batch_size=batch_size,
-            num_workers=kwargs.get("num_workers", 4)
-        )
+    hard_negative_miner.build_index(
+        clip_model=clip_model,
+        dataset=classic_train_dataset,
+        device=device,
+        batch_size=batch_size,
+        num_workers=kwargs.get("num_workers", 4)
+    )
 
     # =========================================================
     # DeepSpeed initialization
@@ -611,7 +628,6 @@ def clip_finetune_fiq_ance(
     best_avg_recall = 0.0 if save_best else None
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
-    use_ance = 0 >= ance_warmup_epochs
 
     logger.info("Training loop started (DeepSpeed ZeRO-2 enabled)")
     for epoch in range(num_epochs):
@@ -619,7 +635,7 @@ def clip_finetune_fiq_ance(
             train_sampler.set_epoch(epoch)
 
         # Refresh ANCE index periodically
-        if epoch > 0 and use_ance:
+        if epoch > 0:
             # For validation/index building, we need the model in eval mode
             model_engine.eval()
             hard_negative_miner.refresh_index(
@@ -631,7 +647,6 @@ def clip_finetune_fiq_ance(
                 num_workers=kwargs.get("num_workers", 4)
             )
 
-        use_ance = epoch >= ance_warmup_epochs
         train_running_results = {"accumulated_train_loss": 0.0, "images_in_epoch": 0}
         train_iter = relative_train_loader
         train_bar = tqdm(train_iter, ncols=150, disable=not is_main_process(dist_info))
@@ -662,20 +677,20 @@ def clip_finetune_fiq_ance(
 
             hard_negative_names = None
             hard_neg_indices = None
-            if use_ance:
-                with torch.no_grad():
-                    hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                        query_features=query_features.detach(),
-                        positive_names=list(target_names),
-                        return_names=True
-                    )
-                    _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                        query_features=ref_features.detach(),
-                        positive_names=list(target_names),
-                        return_names=True
-                    )
+            ref_hard_negative_names = None
+            with torch.no_grad():
+                hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                    query_features=query_features.detach(),
+                    positive_names=list(target_names),
+                    return_names=True
+                )
+                _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                    query_features=ref_features.detach(),
+                    positive_names=list(target_names),
+                    return_names=True
+                )
 
-            if use_ance and hard_negative_names is not None:
+            if hard_negative_names is not None:
                 num_negatives = len(hard_negative_names[0])
                 all_neg_names = [n for batch_names in hard_negative_names for n in batch_names]
                 all_neg_images = classic_train_dataset.get_images_batch(all_neg_names).to(device, non_blocking=True)
@@ -730,6 +745,7 @@ def clip_finetune_fiq_ance(
                     ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
                     partial_intent_negative_features=partial_intent_negative_features,
                     partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
+                    listwise_weight=kwargs.get("listwise_weight", 0.2),
                     logit_scale=train_logit_scale,
                 )
             else:
@@ -737,6 +753,8 @@ def clip_finetune_fiq_ance(
                 sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
                 labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
                 loss = F.cross_entropy(sim_matrix, labels)
+
+            loss_for_logging = loss.detach().float().cpu()
 
             # DeepSpeed handles backward, gradient accumulation, and optimizer step
             model_engine.backward(loss)
@@ -746,7 +764,7 @@ def clip_finetune_fiq_ance(
             if (step + 1) % grad_accum_steps == 0:
                 scheduler.step()
 
-            update_train_running_results(train_running_results, loss.detach(), images_in_batch)
+            update_train_running_results(train_running_results, loss_for_logging, images_in_batch)
             if is_main_process(dist_info):
                 set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
 
@@ -833,7 +851,6 @@ def clip_finetune_cirr_ance(
     ance_topk_candidates: int = 100,
     ance_refresh_interval: int = 1,
     ance_weight: float = 1.0,
-    ance_warmup_epochs: int = 0,
     experiment_name: str = None,
     use_lora: bool = False,
     lora_r: int = 8,
@@ -854,6 +871,8 @@ def clip_finetune_cirr_ance(
     fusion_dropout = kwargs.get("fusion_dropout", 0.1)
     lora_learning_rate = kwargs.get("lora_learning_rate", 5e-5)
     fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
+    gradient_checkpointing = kwargs.get("gradient_checkpointing", True)
+    ance_index_device = kwargs.get("ance_index_device", "cpu")
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -878,6 +897,7 @@ def clip_finetune_cirr_ance(
         fusion_type=fusion_type,
         fusion_hidden_dim=fusion_hidden_dim,
         fusion_dropout=fusion_dropout,
+        gradient_checkpointing=gradient_checkpointing,
     )
 
     if is_main_process(dist_info):
@@ -893,7 +913,7 @@ def clip_finetune_cirr_ance(
             "ance_topk_candidates": ance_topk_candidates,
             "ance_refresh_interval": ance_refresh_interval,
             "ance_weight": ance_weight,
-            "ance_warmup_epochs": ance_warmup_epochs,
+            "listwise_weight": kwargs.get("listwise_weight", 0.2),
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -905,6 +925,8 @@ def clip_finetune_cirr_ance(
             "fusion_learning_rate": fusion_learning_rate,
             "learnable_temperature": True,
             "init_temperature": init_temperature,
+            "gradient_checkpointing": gradient_checkpointing,
+            "ance_index_device": ance_index_device,
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
@@ -924,8 +946,7 @@ def clip_finetune_cirr_ance(
     classic_val_dataset = CIRRDataset("val", "classic", preprocess)
     relative_train_dataset = CIRRDataset("train", "relative", preprocess)
 
-    use_ance_init = num_epochs >= ance_warmup_epochs
-    classic_train_dataset = CIRRDataset("train", "classic", preprocess, preload_images=use_ance_init)
+    classic_train_dataset = CIRRDataset("train", "classic", preprocess, preload_images=True)
 
     # Load partial intent queries for partial intent negative mining
     partial_intent_queries = None
@@ -959,19 +980,18 @@ def clip_finetune_cirr_ance(
         num_negatives=ance_num_negatives,
         topk_candidates=ance_topk_candidates,
         refresh_interval=ance_refresh_interval,
-        use_gpu=True,
+        use_gpu=ance_index_device == "cuda",
         cache_dir=str(training_path / "ance_cache")
     )
 
     logger.info("Building initial embedding index for CIRR...")
-    if use_ance_init:
-        hard_negative_miner.build_index(
-            clip_model=clip_model,
-            dataset=classic_train_dataset,
-            device=device,
-            batch_size=batch_size,
-            num_workers=kwargs.get("num_workers", 4)
-        )
+    hard_negative_miner.build_index(
+        clip_model=clip_model,
+        dataset=classic_train_dataset,
+        device=device,
+        batch_size=batch_size,
+        num_workers=kwargs.get("num_workers", 4)
+    )
 
     # =========================================================
     # DeepSpeed initialization
@@ -1011,7 +1031,6 @@ def clip_finetune_cirr_ance(
     best_arithmetic = 0.0 if save_best else None
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
-    use_ance = 0 >= ance_warmup_epochs
 
     logger.info("Training loop started for CIRR (DeepSpeed ZeRO-2 enabled)")
     for epoch in range(num_epochs):
@@ -1019,7 +1038,7 @@ def clip_finetune_cirr_ance(
             train_sampler.set_epoch(epoch)
 
         # Refresh ANCE index periodically
-        if epoch > 0 and use_ance:
+        if epoch > 0:
             model_engine.eval()
             hard_negative_miner.refresh_index(
                 clip_model=model_engine.module,
@@ -1030,7 +1049,6 @@ def clip_finetune_cirr_ance(
                 num_workers=kwargs.get("num_workers", 4)
             )
 
-        use_ance = epoch >= ance_warmup_epochs
         train_running_results = {"accumulated_train_loss": 0.0, "images_in_epoch": 0}
         train_bar = tqdm(relative_train_loader, ncols=150, disable=not is_main_process(dist_info))
 
@@ -1056,20 +1074,20 @@ def clip_finetune_cirr_ance(
 
             hard_negative_names = None
             hard_neg_indices = None
-            if use_ance:
-                with torch.no_grad():
-                    hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                        query_features=query_features.detach(),
-                        positive_names=list(target_names),
-                        return_names=True
-                    )
-                    _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                        query_features=ref_features.detach(),
-                        positive_names=list(target_names),
-                        return_names=True
-                    )
+            ref_hard_negative_names = None
+            with torch.no_grad():
+                hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                    query_features=query_features.detach(),
+                    positive_names=list(target_names),
+                    return_names=True
+                )
+                _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                    query_features=ref_features.detach(),
+                    positive_names=list(target_names),
+                    return_names=True
+                )
 
-            if use_ance and hard_negative_names is not None:
+            if hard_negative_names is not None:
                 num_negatives = len(hard_negative_names[0])
                 all_neg_names = [n for batch_names in hard_negative_names for n in batch_names]
                 all_neg_images = classic_train_dataset.get_images_batch(all_neg_names).to(device, non_blocking=True)
@@ -1123,6 +1141,7 @@ def clip_finetune_cirr_ance(
                     ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
                     partial_intent_negative_features=partial_intent_negative_features,
                     partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
+                    listwise_weight=kwargs.get("listwise_weight", 0.2),
                     logit_scale=train_logit_scale,
                 )
             else:
@@ -1131,13 +1150,15 @@ def clip_finetune_cirr_ance(
                 labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
                 loss = F.cross_entropy(sim_matrix, labels)
 
+            loss_for_logging = loss.detach().float().cpu()
+
             model_engine.backward(loss)
             model_engine.step()
 
             if (step + 1) % grad_accum_steps == 0:
                 scheduler.step()
 
-            update_train_running_results(train_running_results, loss.detach(), images_in_batch)
+            update_train_running_results(train_running_results, loss_for_logging, images_in_batch)
             if is_main_process(dist_info):
                 set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
 
@@ -1236,10 +1257,10 @@ if __name__ == "__main__":
     parser.add_argument("--ance-topk-candidates", default=100, type=int)
     parser.add_argument("--ance-refresh-interval", default=1, type=int)
     parser.add_argument("--ance-weight", default=1.0, type=float)
-    parser.add_argument("--ance-warmup-epochs", default=0, type=int)
     parser.add_argument("--ref-ance-weight", default=1.0, type=float)
     parser.add_argument("--partial-intent-num-negatives", default=None, type=int)
     parser.add_argument("--partial-intent-weight", default=0.75, type=float)
+    parser.add_argument("--listwise-weight", default=0.2, type=float)
     parser.add_argument("--partial-intent-queries-path", type=str, default=None,
                         help="Path to partial intent queries JSON file")
 
@@ -1256,6 +1277,9 @@ if __name__ == "__main__":
     parser.add_argument("--fusion-dropout", default=0.1, type=float)
     parser.add_argument("--lora-learning-rate", default=5e-5, type=float)
     parser.add_argument("--fusion-learning-rate", default=1e-4, type=float)
+    parser.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true")
+    parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
+    parser.add_argument("--ance-index-device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--seed", default=41, type=int)
 
     # DeepSpeed
@@ -1264,6 +1288,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad-accum-steps", default=1, type=int)
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank passed by DeepSpeed launcher")
+    parser.set_defaults(gradient_checkpointing=True)
 
     args = parser.parse_args()
 
@@ -1292,10 +1317,10 @@ if __name__ == "__main__":
         "ance_topk_candidates": args.ance_topk_candidates,
         "ance_refresh_interval": args.ance_refresh_interval,
         "ance_weight": args.ance_weight,
-        "ance_warmup_epochs": args.ance_warmup_epochs,
         "ref_ance_weight": args.ref_ance_weight,
         "partial_intent_num_negatives": args.partial_intent_num_negatives if args.partial_intent_num_negatives else args.ance_num_negatives,
         "partial_intent_weight": args.partial_intent_weight,
+        "listwise_weight": args.listwise_weight,
         "partial_intent_queries_path": args.partial_intent_queries_path,
         "use_lora": args.use_lora,
         "lora_r": args.lora_r,
@@ -1306,8 +1331,10 @@ if __name__ == "__main__":
         "fusion_dropout": args.fusion_dropout,
         "lora_learning_rate": args.lora_learning_rate,
         "fusion_learning_rate": args.fusion_learning_rate,
+        "gradient_checkpointing": args.gradient_checkpointing,
         "learnable_temperature": True,
         "init_temperature": args.init_temperature,
+        "ance_index_device": args.ance_index_device,
         "seed": args.seed,
         # DeepSpeed
         "dist_info": dist_info,

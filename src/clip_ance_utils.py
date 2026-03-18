@@ -238,7 +238,10 @@ class CLIPHardNegativeMiner:
                     image_features = image_features.mean(dim=1)
 
                 image_features = F.normalize(image_features, dim=-1)
-            all_features.append(image_features)
+            if self.use_gpu:
+                all_features.append(image_features)
+            else:
+                all_features.append(image_features.cpu())
             all_names.extend(names)
         
         self.target_embeddings = torch.cat(all_features, dim=0)
@@ -430,19 +433,22 @@ class CLIPHardNegativeMiner:
         if clip_model is None or tokenizer is None:
             raise ValueError("clip_model and tokenizer are required for text intent negative mining.")
         
-        device = self.target_embeddings.device
+        index_device = self.target_embeddings.device
+        model_device = ref_features.device
         batch_size = text_features.shape[0]
         
-        ref_features = F.normalize(ref_features.to(device), dim=-1)
+        ref_features = F.normalize(ref_features.to(model_device), dim=-1)
         
         # 获取positive indices
-        positive_indices = self._get_positive_indices_tensor(positive_names, device)
+        positive_indices = self._get_positive_indices_tensor(positive_names, index_device)
         
         # 将hard_negative_indices移到正确设备
-        hard_negative_indices = hard_negative_indices.to(device)
+        hard_negative_indices = hard_negative_indices.to(index_device)
         
         # 存储所有负样本indices
-        text_intent_negative_indices = torch.zeros(batch_size, num_negatives, dtype=torch.long, device=device)
+        text_intent_negative_indices = torch.zeros(
+            batch_size, num_negatives, dtype=torch.long, device=index_device
+        )
         
         for i in range(batch_size):
             # 用'and'分割caption
@@ -469,7 +475,7 @@ class CLIPHardNegativeMiner:
                         truncation=True,
                         max_length=77,
                         return_tensors="pt"
-                    ).to(device)
+                    ).to(model_device)
                     # Use autocast for mixed precision compatibility with FSDP
                     with torch.cuda.amp.autocast():
                         part_text_features = clip_model.get_text_features(**inputs)
@@ -509,7 +515,7 @@ class CLIPHardNegativeMiner:
                     n_needed = part_num_negatives - len(valid_indices)
                     random_indices = torch.randint(
                         0, len(self.target_names), (n_needed,),
-                        device=device, dtype=torch.long
+                        device=index_device, dtype=torch.long
                     )
                     all_negative_indices.append(random_indices)
             
@@ -524,7 +530,7 @@ class CLIPHardNegativeMiner:
                     n_needed = num_negatives - len(combined_indices)
                     random_indices = torch.randint(
                         0, len(self.target_names), (n_needed,),
-                        device=device, dtype=torch.long
+                        device=index_device, dtype=torch.long
                     )
                     combined_indices = torch.cat([combined_indices, random_indices], dim=0)
                 
@@ -533,7 +539,7 @@ class CLIPHardNegativeMiner:
                 # 如果没有找到任何负样本，使用随机样本
                 random_indices = torch.randint(
                     0, len(self.target_names), (num_negatives,),
-                    device=device, dtype=torch.long
+                    device=index_device, dtype=torch.long
                 )
                 text_intent_negative_indices[i] = random_indices
         
@@ -619,11 +625,12 @@ class CLIPHardNegativeMiner:
         if clip_model is None or tokenizer is None:
             raise ValueError("clip_model and tokenizer are required.")
 
-        device = self.target_embeddings.device
+        index_device = self.target_embeddings.device
+        model_device = ref_features.device
         batch_size = ref_features.shape[0]
-        ref_features = F.normalize(ref_features.to(device), dim=-1)
-        hard_negative_indices = hard_negative_indices.to(device)
-        positive_indices = self._get_positive_indices_tensor(positive_names, device)
+        ref_features = F.normalize(ref_features.to(model_device), dim=-1)
+        hard_negative_indices = hard_negative_indices.to(index_device)
+        positive_indices = self._get_positive_indices_tensor(positive_names, index_device)
 
         inputs = tokenizer(
             partial_intent_texts,
@@ -631,7 +638,7 @@ class CLIPHardNegativeMiner:
             truncation=True,
             max_length=77,
             return_tensors="pt"
-        ).to(device)
+        ).to(model_device)
         with torch.cuda.amp.autocast():
             partial_text_features = clip_model.get_text_features(**inputs)
             partial_text_features = F.normalize(partial_text_features, dim=-1)
@@ -648,7 +655,7 @@ class CLIPHardNegativeMiner:
         filtered_indices[exclude_mask] = -1
 
         partial_intent_neg_indices = torch.zeros(
-            batch_size, num_negatives, dtype=torch.long, device=device
+            batch_size, num_negatives, dtype=torch.long, device=index_device
         )
 
         for i in range(batch_size):
@@ -662,7 +669,7 @@ class CLIPHardNegativeMiner:
                 n_needed = num_negatives - len(valid_indices)
                 random_indices = torch.randint(
                     0, len(self.target_names), (n_needed,),
-                    device=device, dtype=torch.long
+                    device=index_device, dtype=torch.long
                 )
                 partial_intent_neg_indices[i, len(valid_indices):] = random_indices
 
@@ -707,11 +714,12 @@ class CLIPHardNegativeMiner:
         if clip_model is None or tokenizer is None:
             raise ValueError("clip_model and tokenizer are required.")
 
-        device = self.target_embeddings.device
+        index_device = self.target_embeddings.device
+        model_device = ref_features.device
         batch_size = ref_features.shape[0]
-        ref_features = F.normalize(ref_features.to(device), dim=-1)
-        hard_negative_indices = hard_negative_indices.to(device)
-        positive_indices = self._get_positive_indices_tensor(positive_names, device)
+        ref_features = F.normalize(ref_features.to(model_device), dim=-1)
+        hard_negative_indices = hard_negative_indices.to(index_device)
+        positive_indices = self._get_positive_indices_tensor(positive_names, index_device)
 
         import random
         selected_texts = [
@@ -724,7 +732,7 @@ class CLIPHardNegativeMiner:
             truncation=True,
             max_length=77,
             return_tensors="pt"
-        ).to(device)
+        ).to(model_device)
         with torch.cuda.amp.autocast():
             text_features = clip_model.get_text_features(**inputs)
             text_features = F.normalize(text_features, dim=-1)
@@ -740,7 +748,7 @@ class CLIPHardNegativeMiner:
         filtered_indices = topk_indices.clone()
         filtered_indices[exclude_mask] = -1
 
-        result_indices = torch.zeros(batch_size, num_negatives, dtype=torch.long, device=device)
+        result_indices = torch.zeros(batch_size, num_negatives, dtype=torch.long, device=index_device)
 
         for i in range(batch_size):
             valid_mask = filtered_indices[i] != -1
@@ -754,7 +762,7 @@ class CLIPHardNegativeMiner:
                 n_needed = num_negatives - len(valid)
                 random_idx = torch.randint(
                     0, len(self.target_names), (n_needed,),
-                    device=device, dtype=torch.long
+                    device=index_device, dtype=torch.long
                 )
                 result_indices[i, len(valid):] = random_idx
 
@@ -894,7 +902,64 @@ def compute_listwise_ranking_loss(
     return kl_loss
 
 
-def compute_clip_ance_loss(
+def _ensure_feature_tensor(
+    features: Optional[Union[np.ndarray, torch.Tensor]],
+    device: torch.device,
+    name: str,
+) -> Optional[torch.Tensor]:
+    """Convert numpy features to torch and align them to the query device."""
+    if features is None:
+        return None
+
+    if isinstance(features, np.ndarray):
+        features = torch.from_numpy(features).float()
+
+    if not isinstance(features, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor or np.ndarray, got {type(features)!r}")
+
+    if features.device != device:
+        features = features.to(device, non_blocking=True)
+
+    return features
+
+
+def _compute_target_similarity_matrix(
+    query_features: torch.Tensor,
+    target_features: torch.Tensor,
+) -> torch.Tensor:
+    """Compute query-to-target similarities for both vector and token-level targets."""
+    if target_features.dim() == 2:
+        return torch.matmul(query_features.float(), target_features.float().T)
+
+    if target_features.dim() == 3:
+        return torch.einsum("id,jqd->ijq", query_features.float(), target_features.float()).max(dim=-1).values
+
+    raise ValueError(
+        f"target_features must have shape [B, D] or [B, Q, D], got {tuple(target_features.shape)}"
+    )
+
+
+def _compute_group_similarities(
+    query_features: torch.Tensor,
+    candidate_features: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    """Compute similarities between a query batch and batched candidate groups."""
+    if candidate_features.dim() == 2:
+        candidate_features = candidate_features.unsqueeze(1)
+
+    if candidate_features.dim() != 3:
+        raise ValueError(
+            f"{group_name} must have shape [B, N, D] or [B, D], got {tuple(candidate_features.shape)}"
+        )
+
+    return torch.bmm(
+        query_features.float().unsqueeze(1),
+        candidate_features.float().transpose(1, 2),
+    ).squeeze(1)
+
+
+def compute_clip_ance_listwise_loss(
     query_features: torch.Tensor,
     target_features: torch.Tensor,
     hard_negative_features: torch.Tensor,
@@ -906,7 +971,11 @@ def compute_clip_ance_loss(
     logit_scale: Optional[Union[torch.Tensor, float]] = None,
     **legacy_kwargs,
 ) -> torch.Tensor:
-    """Compute ANCE-style contrastive loss with three-level negatives."""
+    """
+    Listwise ranking loss over the ordered candidate list:
+    target image > hard negatives > partial-intent negatives >
+    reference-image negatives > in-batch samples.
+    """
     device = query_features.device
 
     # Backward compatibility with older training scripts.
@@ -914,131 +983,143 @@ def compute_clip_ance_loss(
         partial_intent_negative_features = legacy_kwargs["text_intent_negative_features"]
     if "text_intent_negative_weight" in legacy_kwargs:
         partial_intent_negative_weight = legacy_kwargs["text_intent_negative_weight"]
-    
-    if isinstance(hard_negative_features, np.ndarray):
-        hard_neg_tensor = torch.from_numpy(hard_negative_features).float().to(device)
-    else:
-        hard_neg_tensor = hard_negative_features
 
-    # ---- Device alignment (important for distributed training) ----
-    # Ensure ALL tensors are on the same device as query_features to avoid cuda:x vs cpu mismatches.
-    if isinstance(target_features, torch.Tensor) and target_features.device != device:
-        target_features = target_features.to(device, non_blocking=True)
-    if isinstance(hard_neg_tensor, torch.Tensor) and hard_neg_tensor.device != device:
-        hard_neg_tensor = hard_neg_tensor.to(device, non_blocking=True)
-    if ref_hard_negative_features is not None and isinstance(ref_hard_negative_features, torch.Tensor):
-        if ref_hard_negative_features.device != device:
-            ref_hard_negative_features = ref_hard_negative_features.to(device, non_blocking=True)
-    if partial_intent_negative_features is not None and isinstance(partial_intent_negative_features, torch.Tensor):
-        if partial_intent_negative_features.device != device:
-            partial_intent_negative_features = partial_intent_negative_features.to(device, non_blocking=True)
-    
-    # 统一归一化
-    query_features = F.normalize(query_features, dim=-1)
-    if target_features.dim() == 3:
-        # (B, Q, D) token/query-level target features (e.g., BLIP2)
-        target_features = F.normalize(target_features, dim=-1)
-    else:
-        # (B, D) vector target features (e.g., CLIP)
-        target_features = F.normalize(target_features, dim=-1)
-    hard_neg_tensor = F.normalize(hard_neg_tensor, dim=-1)
-    
-    # In-batch loss
-    if target_features.dim() == 3:
-        scale = get_similarity_scale(logit_scale=logit_scale)
-        # query: (B,D), target: (B,Q,D) -> sim matrix (B,B) using max over Q
-        sim = torch.einsum("id,jqd->ijq", query_features.float(), target_features.float()).max(dim=-1).values
-        sim = sim * scale
-        labels = torch.arange(query_features.shape[0], dtype=torch.long, device=device)
-        loss_in_batch = F.cross_entropy(sim, labels)
-    else:
-        loss_in_batch = contrastive_in_batch_loss(
-            query_features,
-            target_features,
-            normalized=True,
-            logit_scale=logit_scale,
-        )
-
-    # Hard negative loss
-    if target_features.dim() == 3:
-        scale = get_similarity_scale(logit_scale=logit_scale)
-        # Positive similarity per sample: max over Q
-        sim_pos = torch.einsum("id,iqd->iq", query_features.float(), target_features.float()).max(dim=-1).values
-        # Neg similarities: (B,N)
-        sim_hard = torch.bmm(
-            query_features.float().unsqueeze(1),
-            hard_neg_tensor.float().transpose(1, 2),
-        ).squeeze(1)
-        logits = torch.cat([sim_pos.unsqueeze(1), sim_hard], dim=1) * scale
-        labels_hard = torch.zeros(query_features.shape[0], dtype=torch.long, device=device)
-        loss_hard_negative = F.cross_entropy(logits, labels_hard)
-    else:
-        loss_hard_negative = contrastive_loss_hard_negative(
-            query_features,
-            target_features,
-            hard_neg_tensor,
-            normalized=True,
-            logit_scale=logit_scale,
-        )
-
-    batch_size, num_negatives, dim = hard_neg_tensor.shape
-    query_repeated = query_features.unsqueeze(1).repeat(1, num_negatives, 1).view(-1, dim)
-    hard_neg_flat = hard_neg_tensor.view(-1, dim)
-    loss_hard_in_batch = contrastive_in_batch_loss(
-        query_repeated,
-        hard_neg_flat,
-        logit_scale=logit_scale,
+    target_features = _ensure_feature_tensor(target_features, device, "target_features")
+    hard_neg_tensor = _ensure_feature_tensor(hard_negative_features, device, "hard_negative_features")
+    ref_hard_neg_tensor = _ensure_feature_tensor(
+        ref_hard_negative_features,
+        device,
+        "ref_hard_negative_features",
+    )
+    partial_intent_neg_tensor = _ensure_feature_tensor(
+        partial_intent_negative_features,
+        device,
+        "partial_intent_negative_features",
     )
 
-    total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative + loss_hard_in_batch
-    # total_loss = loss_in_batch + hard_negative_weight * loss_hard_negative
-    # total_loss = loss_in_batch + loss_hard_in_batch
-    
-    # Partial intent negative loss
-    partial_intent_neg_tensor = None
-    if partial_intent_negative_features is not None:
-        partial_intent_neg_tensor = F.normalize(partial_intent_negative_features, dim=-1)
-        loss_partial_intent = contrastive_loss_hard_negative(
-            query_features,
-            target_features,
-            partial_intent_neg_tensor,
-            normalized=True,
-            logit_scale=logit_scale,
-        )
-        total_loss = total_loss + partial_intent_negative_weight * loss_partial_intent
-    
-    # Reference hard negative loss
-    ref_hard_neg_tensor = None
-    if ref_hard_negative_features is not None:
-        ref_hard_neg_tensor = F.normalize(ref_hard_negative_features, dim=-1)
-    
-    # 使用 Listwise 排序来形成负样本之间的偏序
-    # 期望的排序：hard > partial_intent > ref_hard
-    negative_features_list = []
+    query_features = F.normalize(query_features, dim=-1)
+    target_features = F.normalize(target_features, dim=-1)
+    hard_neg_tensor = F.normalize(hard_neg_tensor, dim=-1)
+    if ref_hard_neg_tensor is not None:
+        ref_hard_neg_tensor = F.normalize(ref_hard_neg_tensor, dim=-1)
     if partial_intent_neg_tensor is not None:
-        # 排序为：hard > partial_intent > ref_hard
-        negative_features_list.append(hard_neg_tensor)  # 最高优先级
-        negative_features_list.append(partial_intent_neg_tensor)  # 中等优先级
-        if ref_hard_neg_tensor is not None:
-            negative_features_list.append(ref_hard_neg_tensor)  # 最低优先级
-    elif ref_hard_neg_tensor is not None:
-        # 如果没有 partial_intent，则排序为：hard > ref_hard
-        negative_features_list.append(hard_neg_tensor)
-        negative_features_list.append(ref_hard_neg_tensor)
-    
-    # 如果有多个负样本类型，使用 listwise 排序损失
-    if len(negative_features_list) > 1:
-        # 定义每个类型的权重（权重越高，排名越高）
-        ranking_weights = [1.0, 0.7, 0.4][:len(negative_features_list)]
-        listwise_loss = compute_listwise_ranking_loss(
-            query_features=query_features,
-            negative_features_list=negative_features_list,
-            ranking_weights=ranking_weights,
-            logit_scale=logit_scale,
+        partial_intent_neg_tensor = F.normalize(partial_intent_neg_tensor, dim=-1)
+
+    batch_size = query_features.shape[0]
+    target_sim_matrix = _compute_target_similarity_matrix(query_features, target_features)
+    positive_sim = torch.diagonal(target_sim_matrix, dim1=0, dim2=1).unsqueeze(1)
+
+    ordered_groups: List[Tuple[str, torch.Tensor]] = [("target", positive_sim)]
+
+    hard_sim = _compute_group_similarities(query_features, hard_neg_tensor, "hard_negative_features")
+    if hard_sim.shape[1] > 0:
+        ordered_groups.append(("hard", hard_sim))
+
+    if partial_intent_neg_tensor is not None:
+        partial_sim = _compute_group_similarities(
+            query_features,
+            partial_intent_neg_tensor,
+            "partial_intent_negative_features",
         )
-        total_loss = total_loss + listwise_loss
-    
-    return total_loss
+        if partial_sim.shape[1] > 0:
+            ordered_groups.append(("partial_intent", partial_sim))
+
+    if ref_hard_neg_tensor is not None:
+        ref_sim = _compute_group_similarities(
+            query_features,
+            ref_hard_neg_tensor,
+            "ref_hard_negative_features",
+        )
+        if ref_sim.shape[1] > 0:
+            ordered_groups.append(("ref_hard", ref_sim))
+
+    if batch_size > 1:
+        in_batch_mask = ~torch.eye(batch_size, dtype=torch.bool, device=device)
+        in_batch_sim = target_sim_matrix.masked_select(in_batch_mask).view(batch_size, batch_size - 1)
+        if in_batch_sim.shape[1] > 0:
+            ordered_groups.append(("in_batch", in_batch_sim))
+
+    if len(ordered_groups) == 1:
+        return torch.zeros((), device=device, dtype=query_features.dtype)
+
+    scale = get_similarity_scale(logit_scale=logit_scale)
+    logits = torch.cat([group_sim.float() for _, group_sim in ordered_groups], dim=1) * scale
+
+    raw_group_scores = {
+        "target": 4.0,
+        "hard": 3.0 + float(np.log(max(float(hard_negative_weight), 1e-8))),
+        "partial_intent": 2.0 + float(np.log(max(float(partial_intent_negative_weight), 1e-8))),
+        "ref_hard": 1.0 + float(np.log(max(float(ref_hard_negative_weight), 1e-8))),
+        "in_batch": 0.0,
+    }
+
+    target_score_blocks = []
+    previous_score = None
+    for group_name, group_sim in ordered_groups:
+        group_score = raw_group_scores[group_name]
+        if previous_score is not None:
+            group_score = min(group_score, previous_score - 1e-3)
+        target_score_blocks.append(
+            torch.full(
+                group_sim.shape,
+                fill_value=group_score,
+                device=device,
+                dtype=torch.float32,
+            )
+        )
+        previous_score = group_score
+
+    target_scores = torch.cat(target_score_blocks, dim=1)
+    target_probs = F.softmax(target_scores, dim=-1)
+    log_pred_probs = F.log_softmax(logits, dim=-1)
+
+    return F.kl_div(log_pred_probs, target_probs, reduction="batchmean")
+
+
+def compute_clip_ance_loss(
+    query_features: torch.Tensor,
+    target_features: torch.Tensor,
+    hard_negative_features: torch.Tensor,
+    hard_negative_weight: float = 1.0,
+    ref_hard_negative_features: Optional[torch.Tensor] = None,
+    ref_hard_negative_weight: float = 1.0,
+    partial_intent_negative_features: Optional[torch.Tensor] = None,
+    partial_intent_negative_weight: float = 0.75,
+    listwise_weight: float = 0.2,
+    logit_scale: Optional[Union[torch.Tensor, float]] = None,
+    **legacy_kwargs,
+) -> torch.Tensor:
+    """Hybrid ANCE loss with in-batch CE as the primary objective."""
+    device = query_features.device
+
+    if "listwise_weight" in legacy_kwargs:
+        listwise_weight = legacy_kwargs["listwise_weight"]
+
+    query_features = F.normalize(query_features, dim=-1)
+    target_features = _ensure_feature_tensor(target_features, device, "target_features")
+    target_features = F.normalize(target_features, dim=-1)
+
+    target_sim_matrix = _compute_target_similarity_matrix(query_features, target_features)
+    scale = get_similarity_scale(logit_scale=logit_scale)
+    labels = torch.arange(query_features.shape[0], dtype=torch.long, device=device)
+    loss_in_batch = F.cross_entropy(target_sim_matrix * scale, labels)
+
+    if float(listwise_weight) <= 0.0:
+        return loss_in_batch
+
+    listwise_loss = compute_clip_ance_listwise_loss(
+        query_features=query_features,
+        target_features=target_features,
+        hard_negative_features=hard_negative_features,
+        hard_negative_weight=hard_negative_weight,
+        ref_hard_negative_features=ref_hard_negative_features,
+        ref_hard_negative_weight=ref_hard_negative_weight,
+        partial_intent_negative_features=partial_intent_negative_features,
+        partial_intent_negative_weight=partial_intent_negative_weight,
+        logit_scale=logit_scale,
+        **legacy_kwargs,
+    )
+    return loss_in_batch + float(listwise_weight) * listwise_loss
 
 
 def element_wise_sum(image_features: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
