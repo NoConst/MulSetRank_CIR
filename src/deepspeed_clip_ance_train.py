@@ -173,13 +173,6 @@ def get_clip_model_and_processor(
         )
 
     if gradient_checkpointing:
-        if use_lora and hasattr(model, "enable_input_require_grads"):
-            try:
-                model.enable_input_require_grads()
-            except NotImplementedError:
-                logger.warning(
-                    "Skipping enable_input_require_grads(): CLIPModel does not expose get_input_embeddings()."
-                )
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             logger.info("Enabled gradient checkpointing for CLIP model")
@@ -221,6 +214,37 @@ def extract_clip_index_features(dataset, clip_model, device, batch_size=64, num_
             all_features.append(image_features.cpu())
             all_names.extend(names)
     return torch.vstack(all_features).to(device), all_names
+
+
+def infer_clip_input_dim(
+    clip_model,
+    processor: Optional[CLIPProcessor] = None,
+    default: int = 224,
+) -> int:
+    """Infer the image resolution expected by the current CLIP backbone."""
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is not None:
+        for attribute_name in ("crop_size", "size"):
+            attribute_value = getattr(image_processor, attribute_name, None)
+            if isinstance(attribute_value, dict):
+                for key in ("height", "width", "shortest_edge"):
+                    if key in attribute_value:
+                        return int(attribute_value[key])
+            elif isinstance(attribute_value, int):
+                return int(attribute_value)
+
+    config_candidates = [
+        getattr(clip_model, "config", None),
+        getattr(getattr(clip_model, "model", None), "config", None),
+        getattr(getattr(getattr(clip_model, "base_model", None), "model", None), "config", None),
+    ]
+    for config in config_candidates:
+        vision_config = getattr(config, "vision_config", None)
+        image_size = getattr(vision_config, "image_size", None)
+        if image_size is not None:
+            return int(image_size)
+
+    return default
 
 # =========================================================
 # DeepSpeed save helpers
@@ -456,6 +480,12 @@ def clip_finetune_fiq_ance(
     fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
     gradient_checkpointing = kwargs.get("gradient_checkpointing", True)
     ance_index_device = kwargs.get("ance_index_device", "cpu")
+    listwise_weight = float(kwargs.get("listwise_weight", 0.2))
+    ref_ance_weight = float(kwargs.get("ref_ance_weight", 1.0))
+    partial_intent_weight = float(kwargs.get("partial_intent_weight", 0.75))
+    partial_intent_num_negatives = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+    use_ranked_training = listwise_weight > 0.0
+    fashioniq_val_split_mode = kwargs.get("fashioniq_val_split_mode", "original-split")
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -498,7 +528,10 @@ def clip_finetune_fiq_ance(
             "ance_topk_candidates": ance_topk_candidates,
             "ance_refresh_interval": ance_refresh_interval,
             "ance_weight": ance_weight,
-            "listwise_weight": kwargs.get("listwise_weight", 0.2),
+            "ref_ance_weight": ref_ance_weight,
+            "listwise_weight": listwise_weight,
+            "partial_intent_num_negatives": partial_intent_num_negatives,
+            "partial_intent_weight": partial_intent_weight,
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -512,13 +545,15 @@ def clip_finetune_fiq_ance(
             "init_temperature": init_temperature,
             "gradient_checkpointing": gradient_checkpointing,
             "ance_index_device": ance_index_device,
+            "fashioniq_val_split_mode": fashioniq_val_split_mode,
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
         with open(training_path / "training_hyperparameters.json", "w+") as f:
             json.dump(training_hyper_params, f, sort_keys=True, indent=4)
 
-    input_dim = 224
+    input_dim = infer_clip_input_dim(clip_model=clip_model, processor=processor)
+    logger.info(f"Using input resolution {input_dim} for {clip_model_name}")
     if transform == "squarepad":
         preprocess = squarepad_transform(input_dim)
     elif transform == "targetpad":
@@ -531,15 +566,43 @@ def clip_finetune_fiq_ance(
     relative_val_datasets, classic_val_datasets = [], []
     for idx, dress_type in enumerate(val_dress_types):
         idx_to_dress_mapping[idx] = dress_type
-        relative_val_datasets.append(FashionIQDataset("val", [dress_type], "relative", preprocess))
-        classic_val_datasets.append(FashionIQDataset("val", [dress_type], "classic", preprocess))
+        relative_val_datasets.append(
+            FashionIQDataset(
+                "val",
+                [dress_type],
+                "relative",
+                preprocess,
+                val_split_mode=fashioniq_val_split_mode,
+            )
+        )
+        classic_val_datasets.append(
+            FashionIQDataset(
+                "val",
+                [dress_type],
+                "classic",
+                preprocess,
+                val_split_mode=fashioniq_val_split_mode,
+            )
+        )
 
     relative_train_dataset = FashionIQDataset("train", train_dress_types, "relative", preprocess)
-    classic_train_dataset = FashionIQDataset("train", train_dress_types, "classic", preprocess, preload_images=True)
+    classic_train_dataset = None
+    if use_ranked_training:
+        classic_train_dataset = FashionIQDataset(
+            "train",
+            train_dress_types,
+            "classic",
+            preprocess,
+        )
 
     # Load partial intent queries for partial intent negative mining
     partial_intent_queries = None
-    if partial_intent_queries_path and os.path.exists(partial_intent_queries_path):
+    if (
+        use_ranked_training
+        and partial_intent_weight > 0.0
+        and partial_intent_queries_path
+        and os.path.exists(partial_intent_queries_path)
+    ):
         with open(partial_intent_queries_path, "r") as f:
             partial_intent_queries = json.load(f)
         logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
@@ -565,23 +628,24 @@ def clip_finetune_fiq_ance(
         persistent_workers=True,
     )
 
-    hard_negative_miner = CLIPHardNegativeMiner(
-        embedding_dim=embedding_dim,
-        num_negatives=ance_num_negatives,
-        topk_candidates=ance_topk_candidates,
-        refresh_interval=ance_refresh_interval,
-        use_gpu=ance_index_device == "cuda",
-        cache_dir=str(training_path / "ance_cache")
-    )
+    hard_negative_miner = None
+    if use_ranked_training:
+        hard_negative_miner = CLIPHardNegativeMiner(
+            embedding_dim=embedding_dim,
+            num_negatives=ance_num_negatives,
+            topk_candidates=ance_topk_candidates,
+            refresh_interval=ance_refresh_interval,
+            use_gpu=ance_index_device == "cuda",
+        )
 
-    logger.info("Building initial embedding index...")
-    hard_negative_miner.build_index(
-        clip_model=clip_model,
-        dataset=classic_train_dataset,
-        device=device,
-        batch_size=batch_size,
-        num_workers=kwargs.get("num_workers", 4)
-    )
+        logger.info("Building initial embedding index...")
+        hard_negative_miner.build_index(
+            clip_model=clip_model,
+            dataset=classic_train_dataset,
+            device=device,
+            batch_size=batch_size,
+            num_workers=kwargs.get("num_workers", 4)
+        )
 
     # =========================================================
     # DeepSpeed initialization
@@ -635,7 +699,7 @@ def clip_finetune_fiq_ance(
             train_sampler.set_epoch(epoch)
 
         # Refresh ANCE index periodically
-        if epoch > 0:
+        if use_ranked_training and epoch > 0:
             # For validation/index building, we need the model in eval mode
             model_engine.eval()
             hard_negative_miner.refresh_index(
@@ -675,25 +739,36 @@ def clip_finetune_fiq_ance(
             text_features = F.normalize(text_features, dim=-1)
             query_features = compose_query_features(model_engine.module, ref_features, text_features)
 
-            hard_negative_names = None
-            hard_neg_indices = None
-            ref_hard_negative_names = None
-            with torch.no_grad():
-                hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                    query_features=query_features.detach(),
-                    positive_names=list(target_names),
-                    return_names=True
-                )
-                _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                    query_features=ref_features.detach(),
-                    positive_names=list(target_names),
-                    return_names=True
-                )
+            if not use_ranked_training:
+                scale = get_similarity_scale(logit_scale=train_logit_scale)
+                sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
+                labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
+                loss = F.cross_entropy(sim_matrix, labels)
+            else:
+                hard_negative_names = None
+                hard_neg_indices = None
+                ref_hard_neg_indices = None
+                ref_hard_negative_names = None
+                with torch.no_grad():
+                    hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                        query_features=query_features.detach(),
+                        positive_names=list(target_names),
+                        return_names=True
+                    )
+                    if ref_ance_weight > 0.0:
+                        ref_hard_neg_indices, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                            query_features=ref_features.detach(),
+                            positive_names=list(target_names),
+                            additional_exclude_indices=hard_neg_indices,
+                            return_names=True
+                        )
 
-            if hard_negative_names is not None:
                 num_negatives = len(hard_negative_names[0])
                 all_neg_names = [n for batch_names in hard_negative_names for n in batch_names]
-                all_neg_images = classic_train_dataset.get_images_batch(all_neg_names).to(device, non_blocking=True)
+                all_neg_images = classic_train_dataset.get_images_batch(
+                    all_neg_names,
+                    num_workers=kwargs.get("num_workers", 4),
+                ).to(device, non_blocking=True)
                 all_neg_features = model_engine.module.get_image_features(pixel_values=all_neg_images)
                 all_neg_features = F.normalize(all_neg_features, dim=-1)
                 hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
@@ -703,7 +778,10 @@ def clip_finetune_fiq_ance(
                 if ref_hard_negative_names is not None:
                     num_ref_negatives = len(ref_hard_negative_names[0])
                     all_ref_names = [n for batch_names in ref_hard_negative_names for n in batch_names]
-                    all_ref_images = classic_train_dataset.get_images_batch(all_ref_names)
+                    all_ref_images = classic_train_dataset.get_images_batch(
+                        all_ref_names,
+                        num_workers=kwargs.get("num_workers", 4),
+                    )
                     all_ref_images = all_ref_images.to(device, non_blocking=True)
                     all_ref_features = model_engine.module.get_image_features(pixel_values=all_ref_images)
                     all_ref_features = F.normalize(all_ref_features, dim=-1)
@@ -712,25 +790,34 @@ def clip_finetune_fiq_ance(
 
                 # Mine partial intent negatives
                 partial_intent_negative_features = None
-                if partial_intent_queries is not None and hard_neg_indices is not None:
+                if (
+                    partial_intent_queries is not None
+                    and partial_intent_weight > 0.0
+                    and hard_neg_indices is not None
+                ):
                     partial_intents = [
                         partial_intent_queries.get(cap, cap)
                         for cap in input_captions
                     ]
-                    pi_num_neg = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+                    excluded_neg_indices = hard_neg_indices
+                    if ref_hard_neg_indices is not None:
+                        excluded_neg_indices = torch.cat([hard_neg_indices, ref_hard_neg_indices], dim=1)
                     with torch.no_grad():
                         _, partial_intent_neg_names = hard_negative_miner.mine_partial_intent_negatives(
                             partial_intent_texts=partial_intents,
                             ref_features=ref_features.detach(),
                             positive_names=list(target_names),
-                            hard_negative_indices=hard_neg_indices,
-                            num_negatives=pi_num_neg,
+                            hard_negative_indices=excluded_neg_indices,
+                            num_negatives=partial_intent_num_negatives,
                             clip_model=model_engine.module,
                             tokenizer=tokenizer
                         )
                     num_pi_neg = len(partial_intent_neg_names[0])
                     all_pi_names = [n for batch_names in partial_intent_neg_names for n in batch_names]
-                    all_pi_images = classic_train_dataset.get_images_batch(all_pi_names).to(device, non_blocking=True)
+                    all_pi_images = classic_train_dataset.get_images_batch(
+                        all_pi_names,
+                        num_workers=kwargs.get("num_workers", 4),
+                    ).to(device, non_blocking=True)
                     all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
                     all_pi_features = F.normalize(all_pi_features, dim=-1)
                     partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
@@ -742,17 +829,12 @@ def clip_finetune_fiq_ance(
                     hard_negative_features=hard_negative_features,
                     hard_negative_weight=ance_weight,
                     ref_hard_negative_features=ref_hard_negative_features,
-                    ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
+                    ref_hard_negative_weight=ref_ance_weight,
                     partial_intent_negative_features=partial_intent_negative_features,
-                    partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
-                    listwise_weight=kwargs.get("listwise_weight", 0.2),
+                    partial_intent_negative_weight=partial_intent_weight,
+                    listwise_weight=listwise_weight,
                     logit_scale=train_logit_scale,
                 )
-            else:
-                scale = get_similarity_scale(logit_scale=train_logit_scale)
-                sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
-                labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
-                loss = F.cross_entropy(sim_matrix, labels)
 
             loss_for_logging = loss.detach().float().cpu()
 
@@ -873,6 +955,11 @@ def clip_finetune_cirr_ance(
     fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
     gradient_checkpointing = kwargs.get("gradient_checkpointing", True)
     ance_index_device = kwargs.get("ance_index_device", "cpu")
+    listwise_weight = float(kwargs.get("listwise_weight", 0.2))
+    ref_ance_weight = float(kwargs.get("ref_ance_weight", 1.0))
+    partial_intent_weight = float(kwargs.get("partial_intent_weight", 0.75))
+    partial_intent_num_negatives = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+    use_ranked_training = listwise_weight > 0.0
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     model_name_clean = clip_model_name.replace("/", "-")
@@ -913,7 +1000,10 @@ def clip_finetune_cirr_ance(
             "ance_topk_candidates": ance_topk_candidates,
             "ance_refresh_interval": ance_refresh_interval,
             "ance_weight": ance_weight,
-            "listwise_weight": kwargs.get("listwise_weight", 0.2),
+            "ref_ance_weight": ref_ance_weight,
+            "listwise_weight": listwise_weight,
+            "partial_intent_num_negatives": partial_intent_num_negatives,
+            "partial_intent_weight": partial_intent_weight,
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -933,7 +1023,8 @@ def clip_finetune_cirr_ance(
         with open(training_path / "training_hyperparameters.json", "w+") as f:
             json.dump(training_hyper_params, f, sort_keys=True, indent=4)
 
-    input_dim = 224
+    input_dim = infer_clip_input_dim(clip_model=clip_model, processor=processor)
+    logger.info(f"Using input resolution {input_dim} for {clip_model_name}")
     if transform == "squarepad":
         preprocess = squarepad_transform(input_dim)
     elif transform == "targetpad":
@@ -946,11 +1037,22 @@ def clip_finetune_cirr_ance(
     classic_val_dataset = CIRRDataset("val", "classic", preprocess)
     relative_train_dataset = CIRRDataset("train", "relative", preprocess)
 
-    classic_train_dataset = CIRRDataset("train", "classic", preprocess, preload_images=True)
+    classic_train_dataset = None
+    if use_ranked_training:
+        classic_train_dataset = CIRRDataset(
+            "train",
+            "classic",
+            preprocess,
+        )
 
     # Load partial intent queries for partial intent negative mining
     partial_intent_queries = None
-    if partial_intent_queries_path and os.path.exists(partial_intent_queries_path):
+    if (
+        use_ranked_training
+        and partial_intent_weight > 0.0
+        and partial_intent_queries_path
+        and os.path.exists(partial_intent_queries_path)
+    ):
         with open(partial_intent_queries_path, "r") as f:
             partial_intent_queries = json.load(f)
         logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
@@ -975,23 +1077,24 @@ def clip_finetune_cirr_ance(
         persistent_workers=True,
     )
 
-    hard_negative_miner = CLIPHardNegativeMiner(
-        embedding_dim=embedding_dim,
-        num_negatives=ance_num_negatives,
-        topk_candidates=ance_topk_candidates,
-        refresh_interval=ance_refresh_interval,
-        use_gpu=ance_index_device == "cuda",
-        cache_dir=str(training_path / "ance_cache")
-    )
+    hard_negative_miner = None
+    if use_ranked_training:
+        hard_negative_miner = CLIPHardNegativeMiner(
+            embedding_dim=embedding_dim,
+            num_negatives=ance_num_negatives,
+            topk_candidates=ance_topk_candidates,
+            refresh_interval=ance_refresh_interval,
+            use_gpu=ance_index_device == "cuda",
+        )
 
-    logger.info("Building initial embedding index for CIRR...")
-    hard_negative_miner.build_index(
-        clip_model=clip_model,
-        dataset=classic_train_dataset,
-        device=device,
-        batch_size=batch_size,
-        num_workers=kwargs.get("num_workers", 4)
-    )
+        logger.info("Building initial embedding index for CIRR...")
+        hard_negative_miner.build_index(
+            clip_model=clip_model,
+            dataset=classic_train_dataset,
+            device=device,
+            batch_size=batch_size,
+            num_workers=kwargs.get("num_workers", 4)
+        )
 
     # =========================================================
     # DeepSpeed initialization
@@ -1038,7 +1141,7 @@ def clip_finetune_cirr_ance(
             train_sampler.set_epoch(epoch)
 
         # Refresh ANCE index periodically
-        if epoch > 0:
+        if use_ranked_training and epoch > 0:
             model_engine.eval()
             hard_negative_miner.refresh_index(
                 clip_model=model_engine.module,
@@ -1072,25 +1175,36 @@ def clip_finetune_cirr_ance(
 
             query_features = compose_query_features(model_engine.module, ref_features, text_features)
 
-            hard_negative_names = None
-            hard_neg_indices = None
-            ref_hard_negative_names = None
-            with torch.no_grad():
-                hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                    query_features=query_features.detach(),
-                    positive_names=list(target_names),
-                    return_names=True
-                )
-                _, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                    query_features=ref_features.detach(),
-                    positive_names=list(target_names),
-                    return_names=True
-                )
+            if not use_ranked_training:
+                scale = get_similarity_scale(logit_scale=train_logit_scale)
+                sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
+                labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
+                loss = F.cross_entropy(sim_matrix, labels)
+            else:
+                hard_negative_names = None
+                hard_neg_indices = None
+                ref_hard_neg_indices = None
+                ref_hard_negative_names = None
+                with torch.no_grad():
+                    hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                        query_features=query_features.detach(),
+                        positive_names=list(target_names),
+                        return_names=True
+                    )
+                    if ref_ance_weight > 0.0:
+                        ref_hard_neg_indices, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
+                            query_features=ref_features.detach(),
+                            positive_names=list(target_names),
+                            additional_exclude_indices=hard_neg_indices,
+                            return_names=True
+                        )
 
-            if hard_negative_names is not None:
                 num_negatives = len(hard_negative_names[0])
                 all_neg_names = [n for batch_names in hard_negative_names for n in batch_names]
-                all_neg_images = classic_train_dataset.get_images_batch(all_neg_names).to(device, non_blocking=True)
+                all_neg_images = classic_train_dataset.get_images_batch(
+                    all_neg_names,
+                    num_workers=kwargs.get("num_workers", 4),
+                ).to(device, non_blocking=True)
                 all_neg_features = model_engine.module.get_image_features(pixel_values=all_neg_images)
                 all_neg_features = F.normalize(all_neg_features, dim=-1)
                 hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
@@ -1100,7 +1214,10 @@ def clip_finetune_cirr_ance(
                 if ref_hard_negative_names is not None:
                     num_ref_negatives = len(ref_hard_negative_names[0])
                     all_ref_names = [n for batch_names in ref_hard_negative_names for n in batch_names]
-                    all_ref_images = classic_train_dataset.get_images_batch(all_ref_names).to(device, non_blocking=True)
+                    all_ref_images = classic_train_dataset.get_images_batch(
+                        all_ref_names,
+                        num_workers=kwargs.get("num_workers", 4),
+                    ).to(device, non_blocking=True)
                     all_ref_features = model_engine.module.get_image_features(pixel_values=all_ref_images)
                     all_ref_features = F.normalize(all_ref_features, dim=-1)
                     ref_hard_negative_features = all_ref_features.view(images_in_batch, num_ref_negatives, -1)
@@ -1108,25 +1225,34 @@ def clip_finetune_cirr_ance(
 
                 # Mine partial intent negatives
                 partial_intent_negative_features = None
-                if partial_intent_queries is not None and hard_neg_indices is not None:
+                if (
+                    partial_intent_queries is not None
+                    and partial_intent_weight > 0.0
+                    and hard_neg_indices is not None
+                ):
                     partial_intents = [
                         partial_intent_queries.get(cap, cap)
                         for cap in input_captions
                     ]
-                    pi_num_neg = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+                    excluded_neg_indices = hard_neg_indices
+                    if ref_hard_neg_indices is not None:
+                        excluded_neg_indices = torch.cat([hard_neg_indices, ref_hard_neg_indices], dim=1)
                     with torch.no_grad():
                         _, partial_intent_neg_names = hard_negative_miner.mine_partial_intent_negatives(
                             partial_intent_texts=partial_intents,
                             ref_features=ref_features.detach(),
                             positive_names=list(target_names),
-                            hard_negative_indices=hard_neg_indices,
-                            num_negatives=pi_num_neg,
+                            hard_negative_indices=excluded_neg_indices,
+                            num_negatives=partial_intent_num_negatives,
                             clip_model=model_engine.module,
                             tokenizer=tokenizer
                         )
                     num_pi_neg = len(partial_intent_neg_names[0])
                     all_pi_names = [n for batch_names in partial_intent_neg_names for n in batch_names]
-                    all_pi_images = classic_train_dataset.get_images_batch(all_pi_names).to(device, non_blocking=True)
+                    all_pi_images = classic_train_dataset.get_images_batch(
+                        all_pi_names,
+                        num_workers=kwargs.get("num_workers", 4),
+                    ).to(device, non_blocking=True)
                     all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
                     all_pi_features = F.normalize(all_pi_features, dim=-1)
                     partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
@@ -1138,17 +1264,12 @@ def clip_finetune_cirr_ance(
                     hard_negative_features=hard_negative_features,
                     hard_negative_weight=ance_weight,
                     ref_hard_negative_features=ref_hard_negative_features,
-                    ref_hard_negative_weight=kwargs.get("ref_ance_weight", 1.0),
+                    ref_hard_negative_weight=ref_ance_weight,
                     partial_intent_negative_features=partial_intent_negative_features,
-                    partial_intent_negative_weight=kwargs.get("partial_intent_weight", 0.75),
-                    listwise_weight=kwargs.get("listwise_weight", 0.2),
+                    partial_intent_negative_weight=partial_intent_weight,
+                    listwise_weight=listwise_weight,
                     logit_scale=train_logit_scale,
                 )
-            else:
-                scale = get_similarity_scale(logit_scale=train_logit_scale)
-                sim_matrix = torch.matmul(query_features.float(), target_features.float().T) * scale
-                labels = torch.arange(images_in_batch, dtype=torch.long, device=device)
-                loss = F.cross_entropy(sim_matrix, labels)
 
             loss_for_logging = loss.detach().float().cpu()
 
@@ -1240,7 +1361,7 @@ def set_seed(seed: int = 42) -> None:
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True, help="should be either 'CIRR' or 'fashionIQ'")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--num-epochs", default=100, type=int)
     parser.add_argument("--clip-model-name", default="ViT-B/32", type=str)
     parser.add_argument("--learning-rate", default=5e-5, type=float)
@@ -1280,6 +1401,16 @@ if __name__ == "__main__":
     parser.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
     parser.add_argument("--ance-index-device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument(
+        "--fashioniq-val-split-mode",
+        default="original-split",
+        choices=["val-split", "original-split"],
+        help=(
+            "FashionIQ validation candidate pool mode. "
+            "'val-split' only keeps images that appear in validation queries; "
+            "'original-split' keeps the full validation gallery."
+        ),
+    )
     parser.add_argument("--seed", default=41, type=int)
 
     # DeepSpeed
@@ -1335,6 +1466,7 @@ if __name__ == "__main__":
         "learnable_temperature": True,
         "init_temperature": args.init_temperature,
         "ance_index_device": args.ance_index_device,
+        "fashioniq_val_split_mode": args.fashioniq_val_split_mode,
         "seed": args.seed,
         # DeepSpeed
         "dist_info": dist_info,
