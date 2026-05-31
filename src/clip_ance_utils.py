@@ -180,17 +180,12 @@ class CLIPHardNegativeMiner:
         for names, images in tqdm(dataloader, desc="Extracting features"):
             images = images.to(device, non_blocking=True)
             with torch.cuda.amp.autocast():
-                # Support both HF CLIP (get_image_features) and LAVIS BLIP2 (extract_target_features)
-                if hasattr(clip_model, "get_image_features"):
-                    image_features = clip_model.get_image_features(pixel_values=images)
-                elif hasattr(clip_model, "extract_target_features"):
-                    # BLIP2 returns (features, aux); we only need the projected retrieval embedding
-                    image_features, _ = clip_model.extract_target_features(images, mode="mean")
-                else:
+                if not hasattr(clip_model, "get_image_features"):
                     raise AttributeError(
                         "Unsupported model for CLIPHardNegativeMiner.build_index: "
-                        "expected `get_image_features` (CLIP) or `extract_target_features` (BLIP2)."
+                        "expected Hugging Face CLIP with `get_image_features`."
                     )
+                image_features = clip_model.get_image_features(pixel_values=images)
 
                 # If token-level features are returned, pool to a single vector
                 if image_features.dim() == 3:

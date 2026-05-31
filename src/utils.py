@@ -9,7 +9,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_utils import CIRRDataset, FashionIQDataset,CIRCODataset
+from data_utils import CIRRDataset, FashionIQDataset
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -42,51 +42,6 @@ def extract_index_features(dataset: Union[CIRRDataset, FashionIQDataset], clip_m
             index_names.extend(names)
     return index_features, index_names
 
-
-def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset,CIRCODataset], blip_model, save_memory=False) -> \
-        Tuple[torch.tensor, List[str]]:
-    """
-    Extract FashionIQ or CIRR index features
-    :param dataset: FashionIQ or CIRR dataset in 'classic' mode
-    :param clip_model: CLIP model
-    :param save_memory: if True, move features to CPU to save GPU memory
-    :return: a tensor of features and a list of images
-    """
-    # Use smaller batch size for better memory efficiency
-    batch_size = 32 if save_memory else 64
-    classic_val_loader = DataLoader(dataset=dataset, batch_size=batch_size, num_workers=2,
-                                    pin_memory=False if save_memory else True, collate_fn=collate_fn)
-    index_features = []
-    index_features_raw = []
-    index_names = []
-    if isinstance(dataset, CIRRDataset):
-        print(f"extracting CIRR {dataset.split} index features")
-    elif isinstance(dataset, FashionIQDataset):
-        print(f"extracting fashionIQ {dataset.dress_types} - {dataset.split} index features")
-    for names, images in tqdm(classic_val_loader):
-        images = images.to(device, non_blocking=True)
-        with torch.no_grad():
-            # Important: under DeepSpeed fp16, BLIP2 weights may be half while inputs are float.
-            # Use autocast to keep internal dtypes consistent and avoid Float vs Half matmul errors.
-            with torch.cuda.amp.autocast():
-                image_features, image_embeds_frozen = blip_model.extract_target_features(images, mode="mean")
-            # Move to CPU immediately if save_memory is enabled
-            if save_memory:
-                image_features = image_features.cpu()
-                image_embeds_frozen = image_embeds_frozen.cpu()
-            index_features.append(image_features)
-            index_features_raw.append(image_embeds_frozen)
-            index_names.extend(names)
-        
-        # Clear cache after each batch when save_memory is enabled
-        if save_memory:
-            del images
-            torch.cuda.empty_cache()
-    
-    index_features = torch.vstack(index_features)
-    index_features_raw = torch.vstack(index_features_raw)
-
-    return (index_features, index_features_raw), index_names
 
 def extract_index_fuse_features(dataset: Union[CIRRDataset, FashionIQDataset], fuse_model) -> \
         Tuple[torch.tensor, List[str]]:

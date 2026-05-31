@@ -1,4 +1,6 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_ance_train.py \
+#!/bin/bash
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 nohup deepspeed --num_gpus=5 src/deepspeed_clip_ance_train.py \
     --dataset fashionIQ \
     --clip-model-name "ViT-H/14" \
     --batch-size 8 \
@@ -7,16 +9,17 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_anc
     --lora-learning-rate 5e-5 \
     --fusion-learning-rate 2e-5 \
     --ance-num-negatives 3 \
-    --listwise-weight 0.2 \
+    --listwise-weight 0.5 \
     --use-lora \
     --lora-r 16 \
     --lora-alpha 32 \
     --init-temperature 0.05 \
-    --fusion-type adaptive_residual \
+    --fusion-type sum \
+    --fashioniq-val-split-mode original-split \
     --save-training \
     --save-best \
     --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
-    --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_fiq_H_14_partial_intent_all_listwise_loss.log &
+    --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_fiq_H_14_partial_intent_all_listwise_loss_sum.log &
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_ance_train.py \
     --dataset cirr \
@@ -27,7 +30,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_anc
     --lora-learning-rate 5e-5 \
     --fusion-learning-rate 1e-5 \
     --ance-num-negatives 3 \
-    --listwise-weight 0.2 \
+    --listwise-weight 0.5 \
     --use-lora \
     --lora-r 16 \
     --lora-alpha 32 \
@@ -35,7 +38,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_anc
     --save-training \
     --save-best \
     --partial-intent-queries-path outputs/cirr_partial_intent_queries/partial_intent_queries.json \
-    --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_cirr_H_14_partial_intent_batch4_neg5.log &
+    --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_cirr_H_14_partial.log &
+
+python src/cirr_test_submission.py \
+  --model-path models/clip_ance_cirr_ViT-H-14_lora_2026-03-21_22:10:55/best_model \
+  --submission-name clip_ance_cirr_ViT-H-14_lora_best
+
 
 python src/generate_partial_intent_queries.py \
     --dress_types dress shirt toptee \

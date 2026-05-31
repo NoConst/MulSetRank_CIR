@@ -10,3 +10,16 @@ submission/
 *.pyc
 *.pyo
 *.pyd
+.conda/
+.conda_pkgs/
+logs/
+*.out
+outputs/
+/scripts
+environment.yml
+requirements-torch-cu121.txt
+requirements.txt
+src/clip_ance_utils copy.py
+src/stat_multi_intent_queries.py
+src/visualize_intent_distribution.py
+AGENTS.md

@@ -36,7 +36,15 @@ from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
 from peft import LoraConfig, get_peft_model
 
 from cir_fusion import attach_cir_fusion, compose_query_features, load_cir_fusion, save_cir_fusion
-from data_utils import base_path, squarepad_transform, targetpad_transform, CIRRDataset, FashionIQDataset
+from data_utils import (
+    base_path,
+    squarepad_transform,
+    targetpad_transform,
+    CIRRDataset,
+    FashionIQDataset,
+    Fashion200kDataset,
+    ShoesDataset,
+)
 from utils import collate_fn, update_train_running_results, set_train_bar_description
 from clip_ance_utils import (
     CLIPHardNegativeMiner,
@@ -72,6 +80,17 @@ EMBEDDING_DIMS = {
     "laion/CLIP-ViT-H-14-laion2B-s32B-b79K": 1024,
     "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k": 1280,
 }
+TRANSFORMERS_CLIP_CACHE_PATTERNS = [
+    "config.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "model.safetensors",
+    "pytorch_model.bin",
+]
 
 # =========================================================
 # DeepSpeed distributed helpers
@@ -109,6 +128,58 @@ def all_reduce_sum(dist_info: dict, t: torch.Tensor) -> torch.Tensor:
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t
 
+def make_model_tensors_contiguous(model) -> None:
+    """Ensure DeepSpeed can broadcast all model tensors during initialization."""
+    fixed_parameters = []
+    fixed_buffers = []
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if not param.data.is_contiguous():
+                param.data = param.data.contiguous()
+                fixed_parameters.append(name)
+        for name, buffer in model.named_buffers():
+            if not buffer.data.is_contiguous():
+                buffer.data = buffer.data.contiguous()
+                fixed_buffers.append(name)
+
+    if fixed_parameters or fixed_buffers:
+        logger.info(
+            "Made non-contiguous model tensors contiguous before DeepSpeed init: "
+            f"parameters={fixed_parameters}, buffers={fixed_buffers}"
+        )
+
+def prepare_hf_model_cache_for_distributed(hf_model_name: str) -> bool:
+    """Download HF model files on rank0, then force all ranks to load from local cache."""
+    if Path(hf_model_name).exists() or "RANK" not in os.environ:
+        return False
+    if not hasattr(dist, "is_initialized") or not dist.is_initialized():
+        return False
+
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.utils import LocalEntryNotFoundError
+
+        cache_dir = os.environ.get("HF_HUB_CACHE")
+        try:
+            snapshot_download(
+                repo_id=hf_model_name,
+                cache_dir=cache_dir,
+                allow_patterns=TRANSFORMERS_CLIP_CACHE_PATTERNS,
+                local_files_only=True,
+            )
+        except LocalEntryNotFoundError:
+            logger.info(f"Prefetching {hf_model_name} into Hugging Face cache on rank0")
+            snapshot_download(
+                repo_id=hf_model_name,
+                cache_dir=cache_dir,
+                allow_patterns=TRANSFORMERS_CLIP_CACHE_PATTERNS,
+                max_workers=1,
+            )
+
+    barrier({"enabled": True})
+    return True
+
 # =========================================================
 # Original utilities (minimally adjusted to accept device)
 # =========================================================
@@ -128,10 +199,11 @@ def get_clip_model_and_processor(
     # Map simple names to HF model IDs
     hf_model_name = CLIP_MODEL_MAPPING.get(model_name, model_name)
     logger.info(f"Loading CLIP model: {hf_model_name}")
+    local_files_only = prepare_hf_model_cache_for_distributed(hf_model_name)
 
-    model = CLIPModel.from_pretrained(hf_model_name)
-    processor = CLIPProcessor.from_pretrained(hf_model_name)
-    tokenizer = CLIPTokenizer.from_pretrained(hf_model_name)
+    model = CLIPModel.from_pretrained(hf_model_name, local_files_only=local_files_only)
+    processor = CLIPProcessor.from_pretrained(hf_model_name, local_files_only=local_files_only)
+    tokenizer = CLIPTokenizer.from_pretrained(hf_model_name, local_files_only=local_files_only)
     embedding_dim = EMBEDDING_DIMS.get(hf_model_name, 512)
 
     if use_lora:
@@ -181,6 +253,7 @@ def get_clip_model_and_processor(
 
     # Move model to device
     model = model.to(device)
+    make_model_tensors_contiguous(model)
     logger.info(f"Model loaded. Embedding dimension: {embedding_dim}")
     return model, processor, tokenizer, embedding_dim
 
@@ -439,6 +512,98 @@ def compute_cirr_val_metrics_clip(relative_val_dataset, clip_model, tokenizer, i
     group_recall_at2 = (torch.sum(group_labels[:, :2]) / len(group_labels)).item() * 100
     group_recall_at3 = (torch.sum(group_labels[:, :3]) / len(group_labels)).item() * 100
     return group_recall_at1, group_recall_at2, group_recall_at3, recall_at1, recall_at5, recall_at10, recall_at50
+
+
+def compute_simple_val_metrics_clip(
+    relative_val_dataset,
+    clip_model,
+    tokenizer,
+    index_features,
+    index_names,
+    device,
+    dataset_label: str,
+):
+    print(f"Computing {dataset_label} validation metrics")
+    clip_model.eval()
+    relative_val_loader = DataLoader(
+        dataset=relative_val_dataset,
+        batch_size=32,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        shuffle=False,
+    )
+    name_to_feat = dict(zip(index_names, index_features))
+    predicted_features = []
+    reference_names = []
+    target_names = []
+
+    for batch_reference_names, batch_target_names, captions in tqdm(relative_val_loader):
+        with torch.no_grad():
+            with torch.cuda.amp.autocast():
+                from operator import itemgetter
+                if len(captions) == 1:
+                    reference_features = itemgetter(*batch_reference_names)(name_to_feat).unsqueeze(0)
+                else:
+                    reference_features = torch.stack(itemgetter(*batch_reference_names)(name_to_feat))
+                text_features = encode_text_hf(clip_model, tokenizer, list(captions), device)
+                reference_features = F.normalize(reference_features, dim=-1)
+                text_features = F.normalize(text_features, dim=-1)
+                batch_predicted = compose_query_features(clip_model, reference_features, text_features)
+            predicted_features.append(batch_predicted.cpu())
+
+        reference_names.extend(batch_reference_names)
+        target_names.extend(batch_target_names)
+
+    predicted_features = torch.vstack(predicted_features).to(device)
+    with torch.cuda.amp.autocast():
+        similarities = predicted_features @ index_features.T
+    distances = 1 - similarities
+    sorted_indices = torch.argsort(distances, dim=-1).cpu()
+    sorted_index_names = np.array(index_names)[sorted_indices]
+
+    reference_mask = torch.tensor(
+        sorted_index_names != np.repeat(np.array(reference_names), len(index_names)).reshape(len(target_names), -1)
+    )
+    sorted_index_names = sorted_index_names[reference_mask].reshape(sorted_index_names.shape[0], -1)
+
+    labels = torch.tensor(
+        sorted_index_names == np.repeat(np.array(target_names), len(index_names) - 1).reshape(len(target_names), -1)
+    )
+
+    recall_at1 = (torch.sum(labels[:, :1]) / len(labels)).item() * 100
+    recall_at10 = (torch.sum(labels[:, :10]) / len(labels)).item() * 100
+    recall_at50 = (torch.sum(labels[:, :50]) / len(labels)).item() * 100
+    return recall_at1, recall_at10, recall_at50
+
+
+def build_single_text_datasets(dataset_name: str, preprocess):
+    dataset_key = dataset_name.lower()
+    dataset_label = {
+        "cirr": "CIRR",
+        "fashion200k": "Fashion200k",
+        "shoes": "Shoes",
+    }.get(dataset_key)
+
+    if dataset_key == "cirr":
+        relative_train_dataset = CIRRDataset("train", "relative", preprocess)
+        classic_train_dataset = CIRRDataset("train", "classic", preprocess)
+        relative_val_dataset = CIRRDataset("val", "relative", preprocess)
+        classic_val_dataset = CIRRDataset("val", "classic", preprocess)
+    elif dataset_key == "fashion200k":
+        relative_train_dataset = Fashion200kDataset("train", "relative", preprocess)
+        classic_train_dataset = Fashion200kDataset("train", "classic", preprocess)
+        relative_val_dataset = Fashion200kDataset("val", "relative", preprocess)
+        classic_val_dataset = Fashion200kDataset("val", "classic", preprocess)
+    elif dataset_key == "shoes":
+        relative_train_dataset = ShoesDataset("train", "relative", preprocess)
+        classic_train_dataset = ShoesDataset("train", "classic", preprocess)
+        relative_val_dataset = ShoesDataset("val", "relative", preprocess)
+        classic_val_dataset = ShoesDataset("val", "classic", preprocess)
+    else:
+        raise ValueError(f"Unsupported dataset for single-text training: {dataset_name}")
+
+    return dataset_key, dataset_label, relative_train_dataset, classic_train_dataset, relative_val_dataset, classic_val_dataset
 
 # =========================================================
 # Training loops: keep identical math, add DeepSpeed/rank0-only io
@@ -920,7 +1085,8 @@ def clip_finetune_fiq_ance(
             logger.info(f"Saved final model to {training_path / 'final_model'}")
     barrier(dist_info)
 
-def clip_finetune_cirr_ance(
+def clip_finetune_single_text_ance(
+    dataset_name: str,
     num_epochs: int,
     clip_model_name: str,
     learning_rate: float,
@@ -946,6 +1112,15 @@ def clip_finetune_cirr_ance(
     **kwargs
 ):
     assert dist_info is not None
+    dataset_key = dataset_name.lower()
+    dataset_label = {
+        "cirr": "CIRR",
+        "fashion200k": "Fashion200k",
+        "shoes": "Shoes",
+    }.get(dataset_key)
+    if dataset_label is None:
+        raise ValueError(f"Unsupported dataset for single-text training: {dataset_name}")
+
     device = torch.device(f"cuda:{dist_info['local_rank']}") if torch.cuda.is_available() else torch.device("cpu")
     init_temperature = kwargs.get("init_temperature")
     fusion_type = kwargs.get("fusion_type", "adaptive_residual")
@@ -965,9 +1140,11 @@ def clip_finetune_cirr_ance(
     model_name_clean = clip_model_name.replace("/", "-")
     lora_suffix = "_lora" if use_lora else ""
     if experiment_name:
-        training_path = Path(base_path / f"models/clip_ance_cirr_{model_name_clean}{lora_suffix}_{experiment_name}_{training_start}")
+        training_path = Path(
+            base_path / f"models/clip_ance_{dataset_key}_{model_name_clean}{lora_suffix}_{experiment_name}_{training_start}"
+        )
     else:
-        training_path = Path(base_path / f"models/clip_ance_cirr_{model_name_clean}{lora_suffix}_{training_start}")
+        training_path = Path(base_path / f"models/clip_ance_{dataset_key}_{model_name_clean}{lora_suffix}_{training_start}")
 
     if is_main_process(dist_info):
         training_path.mkdir(exist_ok=False, parents=True)
@@ -1017,6 +1194,7 @@ def clip_finetune_cirr_ance(
             "init_temperature": init_temperature,
             "gradient_checkpointing": gradient_checkpointing,
             "ance_index_device": ance_index_device,
+            "dataset_name": dataset_key,
             "deepspeed_zero_stage": 2,
             "grad_accum_steps": grad_accum_steps,
         }
@@ -1033,17 +1211,17 @@ def clip_finetune_cirr_ance(
     else:
         raise ValueError("Preprocess transform should be in ['squarepad', 'targetpad']")
 
-    relative_val_dataset = CIRRDataset("val", "relative", preprocess)
-    classic_val_dataset = CIRRDataset("val", "classic", preprocess)
-    relative_train_dataset = CIRRDataset("train", "relative", preprocess)
+    (
+        _,
+        _,
+        relative_train_dataset,
+        classic_train_dataset,
+        relative_val_dataset,
+        classic_val_dataset,
+    ) = build_single_text_datasets(dataset_key, preprocess)
 
-    classic_train_dataset = None
-    if use_ranked_training:
-        classic_train_dataset = CIRRDataset(
-            "train",
-            "classic",
-            preprocess,
-        )
+    if not use_ranked_training:
+        classic_train_dataset = None
 
     # Load partial intent queries for partial intent negative mining
     partial_intent_queries = None
@@ -1087,7 +1265,7 @@ def clip_finetune_cirr_ance(
             use_gpu=ance_index_device == "cuda",
         )
 
-        logger.info("Building initial embedding index for CIRR...")
+        logger.info(f"Building initial embedding index for {dataset_label}...")
         hard_negative_miner.build_index(
             clip_model=clip_model,
             dataset=classic_train_dataset,
@@ -1135,7 +1313,7 @@ def clip_finetune_cirr_ance(
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
 
-    logger.info("Training loop started for CIRR (DeepSpeed ZeRO-2 enabled)")
+    logger.info(f"Training loop started for {dataset_label} (DeepSpeed ZeRO-2 enabled)")
     for epoch in range(num_epochs):
         if dist_info["enabled"]:
             train_sampler.set_epoch(epoch)
@@ -1306,23 +1484,46 @@ def clip_finetune_cirr_ance(
                 val_index_features, val_index_names = extract_clip_index_features(
                     classic_val_dataset, model_engine.module, device=device
                 )
-                results = compute_cirr_val_metrics_clip(
-                    relative_val_dataset, model_engine.module, tokenizer, val_index_features, val_index_names, device=device
-                )
-                group_r1, group_r2, group_r3, r1, r5, r10, r50 = results
-                results_dict = {
-                    "group_recall_at1": group_r1,
-                    "group_recall_at2": group_r2,
-                    "group_recall_at3": group_r3,
-                    "recall_at1": r1,
-                    "recall_at5": r5,
-                    "recall_at10": r10,
-                    "recall_at50": r50,
-                    "mean(R@5+R_s@1)": (group_r1 + r5) / 2,
-                    "arithmetic_mean": mean(results),
-                    "harmonic_mean": harmonic_mean(results),
-                    "geometric_mean": geometric_mean(results),
-                }
+                if dataset_key == "cirr":
+                    results = compute_cirr_val_metrics_clip(
+                        relative_val_dataset,
+                        model_engine.module,
+                        tokenizer,
+                        val_index_features,
+                        val_index_names,
+                        device=device,
+                    )
+                    group_r1, group_r2, group_r3, r1, r5, r10, r50 = results
+                    results_dict = {
+                        "group_recall_at1": group_r1,
+                        "group_recall_at2": group_r2,
+                        "group_recall_at3": group_r3,
+                        "recall_at1": r1,
+                        "recall_at5": r5,
+                        "recall_at10": r10,
+                        "recall_at50": r50,
+                        "mean(R@5+R_s@1)": (group_r1 + r5) / 2,
+                        "arithmetic_mean": mean(results),
+                        "harmonic_mean": harmonic_mean(results),
+                        "geometric_mean": geometric_mean(results),
+                    }
+                else:
+                    results = compute_simple_val_metrics_clip(
+                        relative_val_dataset,
+                        model_engine.module,
+                        tokenizer,
+                        val_index_features,
+                        val_index_names,
+                        device=device,
+                        dataset_label=dataset_label,
+                    )
+                    r1, r10, r50 = results
+                    results_dict = {
+                        "recall_at1": r1,
+                        "recall_at10": r10,
+                        "recall_at50": r50,
+                        "arithmetic_mean": mean(results),
+                    }
                 print(json.dumps(results_dict, indent=4))
 
                 del val_index_features, val_index_names
@@ -1360,7 +1561,12 @@ def set_seed(seed: int = 42) -> None:
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--dataset", type=str, required=True, help="should be either 'CIRR' or 'fashionIQ'")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="should be one of 'CIRR', 'fashionIQ', 'fashion200k', or 'shoes'",
+    )
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--num-epochs", default=100, type=int)
     parser.add_argument("--clip-model-name", default="ViT-B/32", type=str)
@@ -1423,8 +1629,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.dataset.lower() not in ["fashioniq", "cirr"]:
-        raise ValueError("Dataset should be either 'CIRR' or 'FashionIQ'")
+    if args.dataset.lower() not in ["fashioniq", "cirr", "fashion200k", "shoes"]:
+        raise ValueError("Dataset should be one of 'CIRR', 'FashionIQ', 'Fashion200k', or 'Shoes'")
 
     # Initialize distributed
     dist_info = init_distributed()
@@ -1467,6 +1673,7 @@ if __name__ == "__main__":
         "init_temperature": args.init_temperature,
         "ance_index_device": args.ance_index_device,
         "fashioniq_val_split_mode": args.fashioniq_val_split_mode,
+        "dataset_name": args.dataset.lower(),
         "seed": args.seed,
         # DeepSpeed
         "dist_info": dist_info,
@@ -1474,11 +1681,11 @@ if __name__ == "__main__":
         "grad_accum_steps": args.grad_accum_steps,
     }
 
-    if args.dataset.lower() == "cirr":
-        clip_finetune_cirr_ance(**training_hyper_params)
-    else:
+    if args.dataset.lower() == "fashioniq":
         training_hyper_params.update({
             "train_dress_types": ["dress", "toptee", "shirt"],
             "val_dress_types": ["dress", "toptee", "shirt"]
         })
         clip_finetune_fiq_ance(**training_hyper_params)
+    else:
+        clip_finetune_single_text_ance(**training_hyper_params)

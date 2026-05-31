@@ -1,6 +1,8 @@
 import json
+import os
+import random
 from pathlib import Path
-from typing import Union, List, Dict, Literal
+from typing import Union, List, Dict, Literal, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 import PIL
@@ -9,12 +11,32 @@ import torchvision.transforms.functional as F
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 import torch 
+import numpy as np
 
 # Project base path (for saving models, outputs, etc.)
 base_path = Path(__file__).absolute().parents[1].absolute()
 
+def _resolve_dataset_path() -> Path:
+    candidates = [
+        os.environ.get("MULSETRANK_DATASETS_DIR"),
+        "/workspace/CAM-CIR_backup/datasets",
+        "/root/siton-data-92a7d2fc7b594215b07e48fd8818598b/CAM-CIR_backup/datasets",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.exists():
+            return path.resolve()
+    return Path(candidates[-1]).expanduser()
+
+
 # Dataset path (where the datasets are stored)
-dataset_path = Path("/root/siton-data-92a7d2fc7b594215b07e48fd8818598b/CAM-CIR_backup/datasets")
+dataset_path = _resolve_dataset_path()
+_FASHION200K_SPLIT_RECORDS_CACHE: Dict[str, List[dict]] = {}
+_FASHION200K_TRAIN_STATE_CACHE: Optional[Tuple[Dict[str, List[int]], Dict[str, List[str]], List[int]]] = None
+_SHOES_NAME_TO_PATH_CACHE: Optional[Dict[str, Path]] = None
+_SHOES_TRIPLETS_CACHE: Dict[str, List[dict]] = {}
 
 def collate_fn(batch):
     '''
@@ -423,6 +445,435 @@ class CIRRDataset(Dataset):
         Returns:
             Stacked tensor of preprocessed images [N, C, H, W]
         """
+        unique_names = list(dict.fromkeys(image_names))
+        if len(unique_names) < 4:
+            unique_images = [self.get_image_by_name(name) for name in unique_names]
+        else:
+            max_workers = min(max(1, num_workers), len(unique_names))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                unique_images = list(executor.map(self.get_image_by_name, unique_names))
+
+        unique_image_map = dict(zip(unique_names, unique_images))
+        images = [unique_image_map[name] for name in image_names]
+        return torch.stack(images)
+
+
+def _fashion200k_caption_post_process(caption: str) -> str:
+    return (
+        caption.strip()
+        .replace(".", "dotmark")
+        .replace("?", "questionmark")
+        .replace("&", "andmark")
+        .replace("*", "starmark")
+    )
+
+
+def _fashion200k_get_different_word(
+    source_caption: str,
+    target_caption: str,
+) -> Optional[Tuple[str, str, str]]:
+    source_words = source_caption.split()
+    target_words = target_caption.split()
+
+    source_word = next((word for word in source_words if word not in target_words), None)
+    target_word = next((word for word in target_words if word not in source_words), None)
+    if source_word is None or target_word is None:
+        return None
+
+    return source_word, target_word, f"replace {source_word} with {target_word}"
+
+
+def _load_fashion200k_split_records(split: Literal["train", "test"]) -> List[dict]:
+    if split in _FASHION200K_SPLIT_RECORDS_CACHE:
+        return _FASHION200K_SPLIT_RECORDS_CACHE[split]
+
+    split_records = []
+    fashion200k_root = dataset_path / "fashion200k"
+
+    for label_file in sorted((fashion200k_root / "labels").glob(f"*_{split}_detect_all.txt")):
+        with open(label_file) as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 3:
+                    continue
+
+                file_path, detection_score, caption = parts
+                full_path = fashion200k_root / file_path
+                split_records.append(
+                    {
+                        "file_path": file_path,
+                        "full_path": full_path,
+                        "detection_score": float(detection_score),
+                        "caption": _fashion200k_caption_post_process(caption),
+                        "exists": full_path.exists(),
+                    }
+                )
+
+    _FASHION200K_SPLIT_RECORDS_CACHE[split] = split_records
+    return split_records
+
+
+def _build_fashion200k_sampling_state(records: List[dict]) -> Tuple[Dict[str, List[int]], Dict[str, List[str]], List[int]]:
+    caption2imgids: Dict[str, List[int]] = {}
+    for idx, record in enumerate(records):
+        record["parent_captions"] = []
+        record["valid_parent_captions"] = []
+        if not record["exists"]:
+            continue
+        caption2imgids.setdefault(record["caption"], []).append(idx)
+
+    parent2children_captions: Dict[str, List[str]] = {}
+    for caption in caption2imgids.keys():
+        for word in caption.split():
+            parent_caption = " ".join(caption.replace(word, "").split())
+            parent2children_captions.setdefault(parent_caption, [])
+            if caption not in parent2children_captions[parent_caption]:
+                parent2children_captions[parent_caption].append(caption)
+
+    for parent_caption, candidate_captions in parent2children_captions.items():
+        if len(candidate_captions) < 2:
+            continue
+        for caption in candidate_captions:
+            for img_idx in caption2imgids[caption]:
+                records[img_idx]["parent_captions"].append(parent_caption)
+
+    valid_source_indices = []
+    for idx, record in enumerate(records):
+        if not record["exists"]:
+            continue
+
+        for parent_caption in record["parent_captions"]:
+            candidate_captions = parent2children_captions[parent_caption]
+            has_valid_target = False
+            for target_caption in candidate_captions:
+                if target_caption == record["caption"]:
+                    continue
+                if not caption2imgids.get(target_caption):
+                    continue
+                if _fashion200k_get_different_word(record["caption"], target_caption) is not None:
+                    has_valid_target = True
+                    break
+
+            if has_valid_target:
+                record["valid_parent_captions"].append(parent_caption)
+
+        if record["valid_parent_captions"]:
+            valid_source_indices.append(idx)
+
+    return caption2imgids, parent2children_captions, valid_source_indices
+
+
+def _get_fashion200k_train_sampling_state() -> Tuple[Dict[str, List[int]], Dict[str, List[str]], List[int]]:
+    global _FASHION200K_TRAIN_STATE_CACHE
+    if _FASHION200K_TRAIN_STATE_CACHE is None:
+        train_records = _load_fashion200k_split_records("train")
+        _FASHION200K_TRAIN_STATE_CACHE = _build_fashion200k_sampling_state(train_records)
+    return _FASHION200K_TRAIN_STATE_CACHE
+
+
+class Fashion200kDataset(Dataset):
+    """
+    Fashion200k dataset for standard CIR training/evaluation.
+    The dataset can be used in 'relative' or 'classic' mode:
+        - In 'classic' mode the dataset yields (image_name, image)
+        - In 'relative' mode the dataset yields:
+            - (reference_image, target_image, rel_caption, target_name) when split == train
+            - (reference_name, target_name, rel_caption) when split == val
+    """
+
+    def __init__(self, split: str, mode: str, preprocess: callable, seed: int = 0):
+        self.preprocess = preprocess
+        self.mode = mode
+        self.split = split
+        self.seed = seed
+        self.data_root = dataset_path / "fashion200k"
+
+        if split not in ["train", "val"]:
+            raise ValueError("split should be in ['train', 'val']")
+        if mode not in ["relative", "classic"]:
+            raise ValueError("mode should be in ['relative', 'classic']")
+
+        split_name = "train" if split == "train" else "test"
+        self.records = _load_fashion200k_split_records(split_name)
+        self.name_to_path = {
+            record["file_path"]: record["full_path"]
+            for record in self.records
+            if record["exists"]
+        }
+
+        if self.mode == "classic":
+            self.image_names = [record["file_path"] for record in self.records if record["exists"]]
+            print(
+                f"Fashion200k {split} dataset in classic mode initialized "
+                f"with {len(self.image_names)} images"
+            )
+            return
+
+        if split == "train":
+            (
+                self.caption2imgids,
+                self.parent2children_captions,
+                self.valid_source_indices,
+            ) = _get_fashion200k_train_sampling_state()
+            if not self.valid_source_indices:
+                raise RuntimeError("No valid Fashion200k training sources found")
+            print(
+                f"Fashion200k train dataset in relative mode initialized "
+                f"with {len(self.records)} source slots and {len(self.valid_source_indices)} valid sources"
+            )
+        else:
+            caption_by_name = {
+                record["file_path"]: record["caption"]
+                for record in self.records
+                if record["exists"]
+            }
+            self.triplets = []
+            skipped_queries = 0
+            with open(self.data_root / "test_queries.txt") as f:
+                for idx, line in enumerate(f):
+                    parts = line.strip().split()
+                    if len(parts) != 2:
+                        continue
+                    reference_name, target_name = parts
+                    if reference_name not in caption_by_name or target_name not in caption_by_name:
+                        skipped_queries += 1
+                        continue
+
+                    diff = _fashion200k_get_different_word(
+                        caption_by_name[reference_name],
+                        caption_by_name[target_name],
+                    )
+                    if diff is None:
+                        skipped_queries += 1
+                        continue
+
+                    self.triplets.append(
+                        {
+                            "reference": reference_name,
+                            "target": target_name,
+                            "caption": diff[2],
+                            "index": idx,
+                        }
+                    )
+
+            print(
+                f"Fashion200k val dataset in relative mode initialized "
+                f"with {len(self.triplets)} queries (skipped {skipped_queries})"
+            )
+
+    def _resolve_train_source_index(self, index: int) -> int:
+        if index < len(self.records):
+            record = self.records[index]
+            if record["exists"] and record.get("valid_parent_captions"):
+                return index
+        return self.valid_source_indices[index % len(self.valid_source_indices)]
+
+    def _sample_train_triplet(self, index: int) -> Tuple[str, str, str]:
+        source_index = self._resolve_train_source_index(index)
+        source_record = self.records[source_index]
+        rng = random.Random(self.seed + index)
+        source_caption = source_record["caption"]
+
+        while True:
+            parent_caption = rng.choice(source_record["valid_parent_captions"])
+            target_caption = rng.choice(self.parent2children_captions[parent_caption])
+            if target_caption == source_caption:
+                continue
+
+            diff = _fashion200k_get_different_word(source_caption, target_caption)
+            if diff is None:
+                continue
+
+            target_candidates = self.caption2imgids.get(target_caption, [])
+            if not target_candidates:
+                continue
+
+            target_index = rng.choice(target_candidates)
+            target_record = self.records[target_index]
+            return source_record["file_path"], target_record["file_path"], diff[2]
+
+    def __getitem__(self, index):
+        try:
+            if self.mode == "relative":
+                if self.split == "train":
+                    reference_name, target_name, rel_caption = self._sample_train_triplet(index)
+                    reference_image = self.preprocess(PIL.Image.open(self.name_to_path[reference_name]))
+                    target_image = self.preprocess(PIL.Image.open(self.name_to_path[target_name]))
+                    return reference_image, target_image, rel_caption, target_name
+
+                triplet = self.triplets[index]
+                return triplet["reference"], triplet["target"], triplet["caption"]
+
+            image_name = self.image_names[index]
+            image = self.preprocess(PIL.Image.open(self.name_to_path[image_name]))
+            return image_name, image
+
+        except Exception as e:
+            print(f"Exception: {e}")
+
+    def __len__(self):
+        if self.mode == "relative":
+            if self.split == "train":
+                return len(self.records)
+            return len(self.triplets)
+        return len(self.image_names)
+
+    def get_image_by_name(self, image_name: str):
+        if image_name not in self.name_to_path:
+            raise ValueError(f"Image name {image_name} not found in Fashion200k dataset")
+        return self.preprocess(PIL.Image.open(self.name_to_path[image_name]))
+
+    def get_images_by_names(self, image_names: List[str], use_parallel: bool = True, num_workers: int = 4):
+        if not use_parallel or len(image_names) < 4:
+            images = [self.get_image_by_name(name) for name in image_names]
+        else:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                images = list(executor.map(self.get_image_by_name, image_names))
+        return torch.stack(images)
+
+    def get_images_batch(self, image_names: List[str], num_workers: int = 4) -> torch.Tensor:
+        unique_names = list(dict.fromkeys(image_names))
+        if len(unique_names) < 4:
+            unique_images = [self.get_image_by_name(name) for name in unique_names]
+        else:
+            max_workers = min(max(1, num_workers), len(unique_names))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                unique_images = list(executor.map(self.get_image_by_name, unique_names))
+
+        unique_image_map = dict(zip(unique_names, unique_images))
+        images = [unique_image_map[name] for name in image_names]
+        return torch.stack(images)
+
+
+def _build_shoes_name_to_path() -> Dict[str, Path]:
+    global _SHOES_NAME_TO_PATH_CACHE
+    if _SHOES_NAME_TO_PATH_CACHE is not None:
+        return _SHOES_NAME_TO_PATH_CACHE
+
+    shoes_root = dataset_path / "shoes_dataset" / "shoes_data"
+    name_to_path = {}
+    for image_path in shoes_root.rglob("*.jpg"):
+        name_to_path[image_path.name] = image_path
+    _SHOES_NAME_TO_PATH_CACHE = name_to_path
+    return name_to_path
+
+
+def _load_shoes_unique_triplets(
+    split: Literal["train", "test"],
+    name_to_path: Dict[str, Path],
+) -> List[dict]:
+    if split in _SHOES_TRIPLETS_CACHE:
+        return _SHOES_TRIPLETS_CACHE[split]
+
+    shoes_root = dataset_path / "shoes_dataset" / "shoes_data"
+    pairs_path = shoes_root / ("relative_pairs_train.npy" if split == "train" else "relative_pairs_test.npy")
+    pairs = np.load(pairs_path, allow_pickle=True)
+
+    triplets = []
+    seen_triplets = set()
+    for item in pairs:
+        reference_name = Path(item["source"]).name
+        target_name = Path(item["target"]).name
+        rel_caption = item["mod"]
+        triplet_key = (reference_name, target_name, rel_caption)
+        if triplet_key in seen_triplets:
+            continue
+        if reference_name not in name_to_path or target_name not in name_to_path:
+            continue
+        seen_triplets.add(triplet_key)
+        triplets.append(
+            {
+                "reference": reference_name,
+                "target": target_name,
+                "caption": rel_caption,
+            }
+        )
+
+    _SHOES_TRIPLETS_CACHE[split] = triplets
+    return triplets
+
+
+class ShoesDataset(Dataset):
+    """
+    Shoes dataset for standard CIR training/evaluation.
+    The dataset can be used in 'relative' or 'classic' mode:
+        - In 'classic' mode the dataset yields (image_name, image)
+        - In 'relative' mode the dataset yields:
+            - (reference_image, target_image, rel_caption, target_name) when split == train
+            - (reference_name, target_name, rel_caption) when split == val
+    """
+
+    def __init__(self, split: str, mode: str, preprocess: callable):
+        self.preprocess = preprocess
+        self.mode = mode
+        self.split = split
+        self.data_root = dataset_path / "shoes_dataset" / "shoes_data"
+
+        if split not in ["train", "val"]:
+            raise ValueError("split should be in ['train', 'val']")
+        if mode not in ["relative", "classic"]:
+            raise ValueError("mode should be in ['relative', 'classic']")
+
+        self.name_to_path = _build_shoes_name_to_path()
+
+        if self.mode == "classic":
+            split_file = self.data_root / ("train_im_names.txt" if split == "train" else "eval_im_names.txt")
+            with open(split_file) as f:
+                self.image_names = [line.strip() for line in f if line.strip() and line.strip() in self.name_to_path]
+            print(
+                f"Shoes {split} dataset in classic mode initialized "
+                f"with {len(self.image_names)} images"
+            )
+            return
+
+        split_name = "train" if split == "train" else "test"
+        self.triplets = _load_shoes_unique_triplets(split_name, self.name_to_path)
+        print(
+            f"Shoes {split} dataset in relative mode initialized "
+            f"with {len(self.triplets)} triplets"
+        )
+
+    def __getitem__(self, index):
+        try:
+            if self.mode == "relative":
+                triplet = self.triplets[index]
+                reference_name = triplet["reference"]
+                target_name = triplet["target"]
+                rel_caption = triplet["caption"]
+
+                if self.split == "train":
+                    reference_image = self.preprocess(PIL.Image.open(self.name_to_path[reference_name]))
+                    target_image = self.preprocess(PIL.Image.open(self.name_to_path[target_name]))
+                    return reference_image, target_image, rel_caption, target_name
+
+                return reference_name, target_name, rel_caption
+
+            image_name = self.image_names[index]
+            image = self.preprocess(PIL.Image.open(self.name_to_path[image_name]))
+            return image_name, image
+
+        except Exception as e:
+            print(f"Exception: {e}")
+
+    def __len__(self):
+        if self.mode == "relative":
+            return len(self.triplets)
+        return len(self.image_names)
+
+    def get_image_by_name(self, image_name: str):
+        if image_name not in self.name_to_path:
+            raise ValueError(f"Image name {image_name} not found in Shoes dataset")
+        return self.preprocess(PIL.Image.open(self.name_to_path[image_name]))
+
+    def get_images_by_names(self, image_names: List[str], use_parallel: bool = True, num_workers: int = 4):
+        if not use_parallel or len(image_names) < 4:
+            images = [self.get_image_by_name(name) for name in image_names]
+        else:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                images = list(executor.map(self.get_image_by_name, image_names))
+        return torch.stack(images)
+
+    def get_images_batch(self, image_names: List[str], num_workers: int = 4) -> torch.Tensor:
         unique_names = list(dict.fromkeys(image_names))
         if len(unique_names) < 4:
             unique_images = [self.get_image_by_name(name) for name in unique_names]

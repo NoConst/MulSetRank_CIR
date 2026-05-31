@@ -7,10 +7,10 @@
     "zero_optimization": {
         "stage": 2,
         "allgather_partitions": true,
-        "allgather_bucket_size": 2e8,
-        "overlap_comm": true,
+        "allgather_bucket_size": 5e7,
+        "overlap_comm": false,
         "reduce_scatter": true,
-        "reduce_bucket_size": 2e8,
+        "reduce_bucket_size": 5e7,
         "contiguous_gradients": true
     },
     
@@ -33,7 +33,8 @@
             "lr": "auto",
             "betas": [0.9, 0.98],
             "eps": 1e-7,
-            "weight_decay": 0.05
+            "weight_decay": 0.05,
+            "torch_adam": true
         }
     },
     
