@@ -21,7 +21,7 @@ from tqdm import tqdm
 from pathlib import Path
 import logging
 
-from cir_fusion import compose_query_features
+from cir_fusion import compose_image_features, compose_query_features
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -192,6 +192,7 @@ class CLIPHardNegativeMiner:
                     image_features = image_features.mean(dim=1)
 
                 image_features = F.normalize(image_features, dim=-1)
+                image_features = compose_image_features(clip_model, image_features)
             if self.use_gpu:
                 all_features.append(image_features)
             else:

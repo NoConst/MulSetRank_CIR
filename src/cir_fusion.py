@@ -114,11 +114,169 @@ class AdaptiveResidualFusion(nn.Module):
         return F.normalize(self.output_norm(fused), dim=-1)
 
 
+class CrossAttentionFusion(nn.Module):
+    """
+    Cross-attention CIR fusion head over global CLIP image/text embeddings.
+
+    For composed queries, the image embedding attends to text-conditioned tokens.
+    For standalone gallery images, `compose_image()` is equivalent to
+    fusion("", image): it uses a learned blank-text token and keeps the output in
+    the same retrieval space as composed queries.
+    """
+
+    fusion_type = "cross_attention"
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        num_heads: int = 8,
+    ):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.hidden_dim = int(hidden_dim or max(256, embedding_dim // 2))
+        self.dropout = float(dropout)
+        self.num_heads = int(num_heads)
+
+        if self.embedding_dim % self.num_heads != 0:
+            raise ValueError(
+                "CrossAttentionFusion requires embedding_dim to be divisible by "
+                f"num_heads, got embedding_dim={self.embedding_dim}, num_heads={self.num_heads}"
+            )
+
+        self.blank_text = nn.Parameter(torch.zeros(self.embedding_dim))
+        self.query_token = nn.Parameter(torch.zeros(1, 1, self.embedding_dim))
+        self.modality_embeddings = nn.Parameter(torch.zeros(4, self.embedding_dim))
+
+        self.image_proj = nn.Linear(self.embedding_dim, self.embedding_dim)
+        self.text_proj = nn.Linear(self.embedding_dim, self.embedding_dim)
+        self.product_proj = nn.Linear(self.embedding_dim, self.embedding_dim)
+        self.delta_proj = nn.Linear(self.embedding_dim, self.embedding_dim)
+        self.token_norm = nn.LayerNorm(self.embedding_dim)
+        self.context_norm = nn.LayerNorm(self.embedding_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.embedding_dim,
+            num_heads=self.num_heads,
+            dropout=self.dropout,
+            batch_first=True,
+        )
+
+        residual_dim = self.embedding_dim * 4
+        self.residual_mlp = nn.Sequential(
+            nn.Linear(residual_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.embedding_dim),
+        )
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(residual_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.embedding_dim),
+        )
+
+        self.image_residual_weight = nn.Parameter(torch.tensor(1.0))
+        self.text_residual_weight = nn.Parameter(torch.tensor(1.0))
+        self.update_scale = nn.Parameter(torch.tensor(1.0))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Start from the stable baselines: image + text for queries, image for gallery.
+        nn.init.zeros_(self.blank_text)
+        nn.init.zeros_(self.query_token)
+        nn.init.zeros_(self.modality_embeddings)
+        for proj in (self.image_proj, self.text_proj, self.product_proj, self.delta_proj):
+            nn.init.zeros_(proj.bias)
+        nn.init.zeros_(self.residual_mlp[-1].weight)
+        nn.init.zeros_(self.residual_mlp[-1].bias)
+        nn.init.zeros_(self.gate_mlp[-1].weight)
+        nn.init.constant_(self.gate_mlp[-1].bias, -2.0)
+
+    def get_config(self) -> dict:
+        return {
+            "fusion_type": self.fusion_type,
+            "embedding_dim": self.embedding_dim,
+            "hidden_dim": self.hidden_dim,
+            "dropout": self.dropout,
+            "num_heads": self.num_heads,
+        }
+
+    def _prepare_inputs(
+        self,
+        image_features: torch.Tensor,
+        text_features: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        module_param = next(self.parameters())
+        compute_device = module_param.device
+        compute_dtype = module_param.dtype
+
+        image_features = F.normalize(
+            image_features.to(device=compute_device, dtype=compute_dtype),
+            dim=-1,
+        )
+
+        has_text = text_features is not None
+        if has_text:
+            text_features = F.normalize(
+                text_features.to(device=compute_device, dtype=compute_dtype),
+                dim=-1,
+            )
+        else:
+            text_features = self.blank_text.unsqueeze(0).expand(image_features.shape[0], -1)
+
+        return image_features, text_features, has_text
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        image_features, text_features, has_text = self._prepare_inputs(image_features, text_features)
+
+        product_features = image_features * text_features
+        delta_features = image_features - text_features
+        tokens = torch.stack(
+            [
+                self.image_proj(image_features),
+                self.text_proj(text_features),
+                self.product_proj(product_features),
+                self.delta_proj(delta_features),
+            ],
+            dim=1,
+        )
+        tokens = self.token_norm(tokens + self.modality_embeddings.unsqueeze(0))
+
+        query_token = self.query_token.expand(image_features.shape[0], -1, -1)
+        query_token = query_token + self.image_proj(image_features).unsqueeze(1)
+        context, _ = self.cross_attn(query_token, tokens, tokens, need_weights=False)
+        context = self.context_norm(context.squeeze(1))
+
+        residual_input = torch.cat(
+            [image_features, text_features, product_features, context],
+            dim=-1,
+        )
+        residual = self.residual_mlp(residual_input)
+        gate = torch.sigmoid(self.gate_mlp(residual_input))
+
+        base = self.image_residual_weight * image_features
+        if has_text:
+            base = base + self.text_residual_weight * text_features
+
+        fused = base + self.update_scale * gate * residual
+        return F.normalize(fused, dim=-1)
+
+    def compose_image(self, image_features: torch.Tensor) -> torch.Tensor:
+        return self.forward(image_features=image_features, text_features=None)
+
+
 def build_cir_fusion_module(
     fusion_type: str,
     embedding_dim: int,
     hidden_dim: Optional[int] = None,
     dropout: float = 0.1,
+    num_heads: int = 8,
 ) -> Optional[nn.Module]:
     fusion_type = fusion_type.lower()
     if fusion_type == "sum":
@@ -128,6 +286,13 @@ def build_cir_fusion_module(
             embedding_dim=embedding_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
+        )
+    if fusion_type in {"cross_attention", "cross_attn"}:
+        return CrossAttentionFusion(
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            num_heads=num_heads,
         )
     raise ValueError(f"Unsupported fusion_type: {fusion_type}")
 
@@ -153,6 +318,7 @@ def attach_cir_fusion(
     fusion_type: str = "adaptive_residual",
     hidden_dim: Optional[int] = None,
     dropout: float = 0.1,
+    num_heads: int = 8,
     log: Optional[logging.Logger] = None,
 ) -> Optional[nn.Module]:
     fusion_module = build_cir_fusion_module(
@@ -160,6 +326,7 @@ def attach_cir_fusion(
         embedding_dim=embedding_dim,
         hidden_dim=hidden_dim,
         dropout=dropout,
+        num_heads=num_heads,
     )
     model.cir_fusion = fusion_module
 
@@ -170,7 +337,9 @@ def attach_cir_fusion(
             log.info(
                 "Attached CIR fusion head: "
                 f"{fusion_module.fusion_type} "
-                f"(hidden_dim={fusion_module.hidden_dim}, dropout={fusion_module.dropout})"
+                f"(hidden_dim={fusion_module.hidden_dim}, "
+                f"dropout={fusion_module.dropout}, "
+                f"num_heads={getattr(fusion_module, 'num_heads', 'n/a')})"
             )
     return fusion_module
 
@@ -184,6 +353,17 @@ def compose_query_features(
     if fusion_module is None:
         return F.normalize(image_features + text_features, dim=-1)
     return fusion_module(image_features, text_features)
+
+
+def compose_image_features(
+    model,
+    image_features: torch.Tensor,
+) -> torch.Tensor:
+    """Compose a standalone image as fusion("", image) when the head supports it."""
+    fusion_module = get_model_cir_fusion(model)
+    if fusion_module is not None and hasattr(fusion_module, "compose_image"):
+        return fusion_module.compose_image(image_features)
+    return F.normalize(image_features, dim=-1)
 
 
 def save_cir_fusion(
@@ -241,6 +421,7 @@ def load_cir_fusion(
         fusion_type=fusion_type,
         hidden_dim=config.get("hidden_dim"),
         dropout=config.get("dropout", 0.1),
+        num_heads=config.get("num_heads", 8),
         log=None,
     )
 

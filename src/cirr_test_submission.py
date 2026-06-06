@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import CLIPModel, CLIPTokenizer
 
-from cir_fusion import compose_query_features, load_cir_fusion
+from cir_fusion import compose_image_features, compose_query_features, load_cir_fusion
 from clip_ance_utils import get_model_logit_scale
 from data_utils import CIRRDataset, base_path, targetpad_transform
 from utils import collate_fn, device
@@ -195,6 +195,7 @@ def extract_clip_index_features(
     dataset: CIRRDataset,
     clip_model,
     batch_size: int,
+    return_raw_features: bool = False,
 ) -> Tuple[torch.Tensor, List[str]]:
     dataloader = DataLoader(
         dataset=dataset,
@@ -206,6 +207,7 @@ def extract_clip_index_features(
     )
 
     all_features = []
+    all_raw_features = []
     all_names = []
 
     print(f"Extracting CIRR {dataset.split} index features")
@@ -213,12 +215,19 @@ def extract_clip_index_features(
         images = images.to(device, non_blocking=device.type == "cuda")
         with torch.no_grad():
             with autocast_if_available():
-                image_features = clip_model.get_image_features(pixel_values=images)
-                image_features = F.normalize(image_features, dim=-1)
+                raw_image_features = clip_model.get_image_features(pixel_values=images)
+                raw_image_features = F.normalize(raw_image_features, dim=-1)
+                image_features = compose_image_features(clip_model, raw_image_features)
             all_features.append(image_features.cpu())
+            if return_raw_features:
+                all_raw_features.append(raw_image_features.cpu())
             all_names.extend(names)
 
-    return torch.vstack(all_features).to(device), all_names
+    index_features = torch.vstack(all_features).to(device)
+    if return_raw_features:
+        raw_features = torch.vstack(all_raw_features).to(device)
+        return index_features, all_names, raw_features
+    return index_features, all_names
 
 
 def encode_text(clip_model, tokenizer, captions: List[str]) -> torch.Tensor:
@@ -243,6 +252,7 @@ def generate_cirr_test_predictions(
     index_names: List[str],
     index_features: torch.Tensor,
     batch_size: int,
+    reference_index_features: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, List[str], List[List[str]], List[str]]:
     print("Computing CIRR test predictions")
 
@@ -255,7 +265,8 @@ def generate_cirr_test_predictions(
         shuffle=False,
     )
 
-    name_to_feat = dict(zip(index_names, index_features))
+    reference_lookup_features = reference_index_features if reference_index_features is not None else index_features
+    name_to_feat = dict(zip(index_names, reference_lookup_features))
     pairs_id = []
     group_members = []
     reference_names = []
@@ -293,6 +304,7 @@ def generate_cirr_test_dicts(
     index_features: torch.Tensor,
     index_names: List[str],
     batch_size: int,
+    reference_index_features: torch.Tensor = None,
 ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     predicted_similarities, reference_names, group_members, pairs_id = generate_cirr_test_predictions(
         clip_model=clip_model,
@@ -301,6 +313,7 @@ def generate_cirr_test_dicts(
         index_names=index_names,
         index_features=index_features,
         batch_size=batch_size,
+        reference_index_features=reference_index_features,
     )
 
     print("Computing CIRR prediction dicts")
@@ -350,10 +363,11 @@ def generate_cirr_test_submissions(
     batch_size: int,
 ) -> None:
     classic_test_dataset = CIRRDataset("test1", "classic", preprocess)
-    index_features, index_names = extract_clip_index_features(
+    index_features, index_names, reference_index_features = extract_clip_index_features(
         classic_test_dataset,
         clip_model,
         batch_size=batch_size,
+        return_raw_features=True,
     )
     relative_test_dataset = CIRRDataset("test1", "relative", preprocess)
 
@@ -364,6 +378,7 @@ def generate_cirr_test_submissions(
         index_features=index_features,
         index_names=index_names,
         batch_size=batch_size,
+        reference_index_features=reference_index_features,
     )
 
     submission = {

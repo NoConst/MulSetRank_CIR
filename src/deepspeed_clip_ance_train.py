@@ -35,7 +35,13 @@ from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
 # LoRA
 from peft import LoraConfig, get_peft_model
 
-from cir_fusion import attach_cir_fusion, compose_query_features, load_cir_fusion, save_cir_fusion
+from cir_fusion import (
+    attach_cir_fusion,
+    compose_image_features,
+    compose_query_features,
+    load_cir_fusion,
+    save_cir_fusion,
+)
 from data_utils import (
     base_path,
     squarepad_transform,
@@ -194,6 +200,7 @@ def get_clip_model_and_processor(
     fusion_type: str = "adaptive_residual",
     fusion_hidden_dim: Optional[int] = None,
     fusion_dropout: float = 0.1,
+    fusion_num_heads: int = 8,
     gradient_checkpointing: bool = False,
 ):
     # Map simple names to HF model IDs
@@ -241,6 +248,7 @@ def get_clip_model_and_processor(
             fusion_type=fusion_type,
             hidden_dim=fusion_hidden_dim,
             dropout=fusion_dropout,
+            num_heads=fusion_num_heads,
             log=logger,
         )
 
@@ -270,23 +278,39 @@ def encode_text_hf(clip_model, tokenizer, texts, device):
         text_features = clip_model.get_text_features(**inputs)
     return text_features
 
-def extract_clip_index_features(dataset, clip_model, device, batch_size=64, num_workers=4):
+def extract_clip_index_features(
+    dataset,
+    clip_model,
+    device,
+    batch_size=64,
+    num_workers=4,
+    return_raw_features: bool = False,
+):
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True, collate_fn=collate_fn
     )
     clip_model.eval()
     all_features = []
+    all_raw_features = []
     all_names = []
     for names, images in tqdm(dataloader, desc="Extracting index features", disable=not hasattr(tqdm, "__call__")):
         images = images.to(device, non_blocking=True)
         with torch.no_grad():
             with torch.cuda.amp.autocast():
-                image_features = clip_model.get_image_features(pixel_values=images)
-                image_features = F.normalize(image_features, dim=-1)
+                raw_image_features = clip_model.get_image_features(pixel_values=images)
+                raw_image_features = F.normalize(raw_image_features, dim=-1)
+                image_features = compose_image_features(clip_model, raw_image_features)
             all_features.append(image_features.cpu())
+            if return_raw_features:
+                all_raw_features.append(raw_image_features.cpu())
             all_names.extend(names)
-    return torch.vstack(all_features).to(device), all_names
+
+    index_features = torch.vstack(all_features).to(device)
+    if return_raw_features:
+        raw_features = torch.vstack(all_raw_features).to(device)
+        return index_features, all_names, raw_features
+    return index_features, all_names
 
 
 def infer_clip_input_dim(
@@ -406,14 +430,23 @@ def build_trainable_param_groups(
 # =========================================================
 # Validation metrics (unchanged except device passed in)
 # =========================================================
-def compute_fiq_val_metrics_clip(relative_val_dataset, clip_model, tokenizer, index_features, index_names, device):
+def compute_fiq_val_metrics_clip(
+    relative_val_dataset,
+    clip_model,
+    tokenizer,
+    index_features,
+    index_names,
+    device,
+    reference_index_features=None,
+):
     print(f"Computing FashionIQ {relative_val_dataset.dress_types} validation metrics")
     clip_model.eval()
     relative_val_loader = DataLoader(
         dataset=relative_val_dataset, batch_size=32,
         num_workers=4, pin_memory=True, collate_fn=collate_fn, shuffle=False
     )
-    name_to_feat = dict(zip(index_names, index_features))
+    reference_lookup_features = reference_index_features if reference_index_features is not None else index_features
+    name_to_feat = dict(zip(index_names, reference_lookup_features))
     predicted_features = []
     target_names = []
 
@@ -452,14 +485,23 @@ def compute_fiq_val_metrics_clip(relative_val_dataset, clip_model, tokenizer, in
     recall_at50 = (torch.sum(labels[:, :50]) / len(labels)).item() * 100
     return recall_at10, recall_at50
 
-def compute_cirr_val_metrics_clip(relative_val_dataset, clip_model, tokenizer, index_features, index_names, device):
+def compute_cirr_val_metrics_clip(
+    relative_val_dataset,
+    clip_model,
+    tokenizer,
+    index_features,
+    index_names,
+    device,
+    reference_index_features=None,
+):
     print("Computing CIRR validation metrics")
     clip_model.eval()
     relative_val_loader = DataLoader(
         dataset=relative_val_dataset, batch_size=32,
         num_workers=4, pin_memory=True, collate_fn=collate_fn, shuffle=False
     )
-    name_to_feat = dict(zip(index_names, index_features))
+    reference_lookup_features = reference_index_features if reference_index_features is not None else index_features
+    name_to_feat = dict(zip(index_names, reference_lookup_features))
     predicted_features = []
     reference_names = []
     target_names = []
@@ -522,6 +564,7 @@ def compute_simple_val_metrics_clip(
     index_names,
     device,
     dataset_label: str,
+    reference_index_features=None,
 ):
     print(f"Computing {dataset_label} validation metrics")
     clip_model.eval()
@@ -533,7 +576,8 @@ def compute_simple_val_metrics_clip(
         collate_fn=collate_fn,
         shuffle=False,
     )
-    name_to_feat = dict(zip(index_names, index_features))
+    reference_lookup_features = reference_index_features if reference_index_features is not None else index_features
+    name_to_feat = dict(zip(index_names, reference_lookup_features))
     predicted_features = []
     reference_names = []
     target_names = []
@@ -641,6 +685,7 @@ def clip_finetune_fiq_ance(
     fusion_type = kwargs.get("fusion_type", "adaptive_residual")
     fusion_hidden_dim = kwargs.get("fusion_hidden_dim")
     fusion_dropout = kwargs.get("fusion_dropout", 0.1)
+    fusion_num_heads = kwargs.get("fusion_num_heads", 8)
     lora_learning_rate = kwargs.get("lora_learning_rate", 5e-5)
     fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
     gradient_checkpointing = kwargs.get("gradient_checkpointing", True)
@@ -676,6 +721,7 @@ def clip_finetune_fiq_ance(
         fusion_type=fusion_type,
         fusion_hidden_dim=fusion_hidden_dim,
         fusion_dropout=fusion_dropout,
+        fusion_num_heads=fusion_num_heads,
         gradient_checkpointing=gradient_checkpointing,
     )
 
@@ -704,6 +750,7 @@ def clip_finetune_fiq_ance(
             "fusion_type": fusion_type,
             "fusion_hidden_dim": fusion_hidden_dim,
             "fusion_dropout": fusion_dropout,
+            "fusion_num_heads": fusion_num_heads,
             "lora_learning_rate": lora_learning_rate,
             "fusion_learning_rate": fusion_learning_rate,
             "learnable_temperature": True,
@@ -903,6 +950,7 @@ def clip_finetune_fiq_ance(
             target_features = F.normalize(target_features, dim=-1)
             text_features = F.normalize(text_features, dim=-1)
             query_features = compose_query_features(model_engine.module, ref_features, text_features)
+            target_features = compose_image_features(model_engine.module, target_features)
 
             if not use_ranked_training:
                 scale = get_similarity_scale(logit_scale=train_logit_scale)
@@ -914,7 +962,9 @@ def clip_finetune_fiq_ance(
                 hard_neg_indices = None
                 ref_hard_neg_indices = None
                 ref_hard_negative_names = None
+                model_engine.eval()
                 with torch.no_grad():
+                    ref_search_features = compose_image_features(model_engine.module, ref_features)
                     hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
                         query_features=query_features.detach(),
                         positive_names=list(target_names),
@@ -922,11 +972,12 @@ def clip_finetune_fiq_ance(
                     )
                     if ref_ance_weight > 0.0:
                         ref_hard_neg_indices, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                            query_features=ref_features.detach(),
+                            query_features=ref_search_features.detach(),
                             positive_names=list(target_names),
                             additional_exclude_indices=hard_neg_indices,
                             return_names=True
                         )
+                model_engine.train()
 
                 num_negatives = len(hard_negative_names[0])
                 all_neg_names = [n for batch_names in hard_negative_names for n in batch_names]
@@ -936,6 +987,7 @@ def clip_finetune_fiq_ance(
                 ).to(device, non_blocking=True)
                 all_neg_features = model_engine.module.get_image_features(pixel_values=all_neg_images)
                 all_neg_features = F.normalize(all_neg_features, dim=-1)
+                all_neg_features = compose_image_features(model_engine.module, all_neg_features)
                 hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
                 del all_neg_images, all_neg_features
 
@@ -950,6 +1002,7 @@ def clip_finetune_fiq_ance(
                     all_ref_images = all_ref_images.to(device, non_blocking=True)
                     all_ref_features = model_engine.module.get_image_features(pixel_values=all_ref_images)
                     all_ref_features = F.normalize(all_ref_features, dim=-1)
+                    all_ref_features = compose_image_features(model_engine.module, all_ref_features)
                     ref_hard_negative_features = all_ref_features.view(images_in_batch, num_ref_negatives, -1)
                     del all_ref_images, all_ref_features
 
@@ -985,6 +1038,7 @@ def clip_finetune_fiq_ance(
                     ).to(device, non_blocking=True)
                     all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
                     all_pi_features = F.normalize(all_pi_features, dim=-1)
+                    all_pi_features = compose_image_features(model_engine.module, all_pi_features)
                     partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
                     del all_pi_images, all_pi_features
 
@@ -1042,15 +1096,24 @@ def clip_finetune_fiq_ance(
                     relative_val_datasets, classic_val_datasets, idx_to_dress_mapping
                 ):
                     torch.cuda.empty_cache()
-                    index_features, index_names = extract_clip_index_features(
-                        classic_val_dataset, model_engine.module, device=device
+                    index_features, index_names, reference_index_features = extract_clip_index_features(
+                        classic_val_dataset,
+                        model_engine.module,
+                        device=device,
+                        return_raw_features=True,
                     )
                     r10, r50 = compute_fiq_val_metrics_clip(
-                        relative_val_dataset, model_engine.module, tokenizer, index_features, index_names, device=device
+                        relative_val_dataset,
+                        model_engine.module,
+                        tokenizer,
+                        index_features,
+                        index_names,
+                        device=device,
+                        reference_index_features=reference_index_features,
                     )
                     recalls_at10.append(r10)
                     recalls_at50.append(r50)
-                    del index_features, index_names
+                    del index_features, index_names, reference_index_features
                     torch.cuda.empty_cache()
 
                 results_dict = {f"{idx_to_dress_mapping[i]}_recall_at10": recalls_at10[i] for i in range(len(recalls_at10))}
@@ -1126,6 +1189,7 @@ def clip_finetune_single_text_ance(
     fusion_type = kwargs.get("fusion_type", "adaptive_residual")
     fusion_hidden_dim = kwargs.get("fusion_hidden_dim")
     fusion_dropout = kwargs.get("fusion_dropout", 0.1)
+    fusion_num_heads = kwargs.get("fusion_num_heads", 8)
     lora_learning_rate = kwargs.get("lora_learning_rate", 5e-5)
     fusion_learning_rate = kwargs.get("fusion_learning_rate", 1e-4)
     gradient_checkpointing = kwargs.get("gradient_checkpointing", True)
@@ -1161,6 +1225,7 @@ def clip_finetune_single_text_ance(
         fusion_type=fusion_type,
         fusion_hidden_dim=fusion_hidden_dim,
         fusion_dropout=fusion_dropout,
+        fusion_num_heads=fusion_num_heads,
         gradient_checkpointing=gradient_checkpointing,
     )
 
@@ -1188,6 +1253,7 @@ def clip_finetune_single_text_ance(
             "fusion_type": fusion_type,
             "fusion_hidden_dim": fusion_hidden_dim,
             "fusion_dropout": fusion_dropout,
+            "fusion_num_heads": fusion_num_heads,
             "lora_learning_rate": lora_learning_rate,
             "fusion_learning_rate": fusion_learning_rate,
             "learnable_temperature": True,
@@ -1352,6 +1418,7 @@ def clip_finetune_single_text_ance(
             text_features = F.normalize(text_features, dim=-1)
 
             query_features = compose_query_features(model_engine.module, ref_features, text_features)
+            target_features = compose_image_features(model_engine.module, target_features)
 
             if not use_ranked_training:
                 scale = get_similarity_scale(logit_scale=train_logit_scale)
@@ -1363,7 +1430,9 @@ def clip_finetune_single_text_ance(
                 hard_neg_indices = None
                 ref_hard_neg_indices = None
                 ref_hard_negative_names = None
+                model_engine.eval()
                 with torch.no_grad():
+                    ref_search_features = compose_image_features(model_engine.module, ref_features)
                     hard_neg_indices, hard_negative_names = hard_negative_miner.mine_hard_negatives(
                         query_features=query_features.detach(),
                         positive_names=list(target_names),
@@ -1371,11 +1440,12 @@ def clip_finetune_single_text_ance(
                     )
                     if ref_ance_weight > 0.0:
                         ref_hard_neg_indices, ref_hard_negative_names = hard_negative_miner.mine_hard_negatives(
-                            query_features=ref_features.detach(),
+                            query_features=ref_search_features.detach(),
                             positive_names=list(target_names),
                             additional_exclude_indices=hard_neg_indices,
                             return_names=True
                         )
+                model_engine.train()
 
                 num_negatives = len(hard_negative_names[0])
                 all_neg_names = [n for batch_names in hard_negative_names for n in batch_names]
@@ -1385,6 +1455,7 @@ def clip_finetune_single_text_ance(
                 ).to(device, non_blocking=True)
                 all_neg_features = model_engine.module.get_image_features(pixel_values=all_neg_images)
                 all_neg_features = F.normalize(all_neg_features, dim=-1)
+                all_neg_features = compose_image_features(model_engine.module, all_neg_features)
                 hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
                 del all_neg_images, all_neg_features
 
@@ -1398,6 +1469,7 @@ def clip_finetune_single_text_ance(
                     ).to(device, non_blocking=True)
                     all_ref_features = model_engine.module.get_image_features(pixel_values=all_ref_images)
                     all_ref_features = F.normalize(all_ref_features, dim=-1)
+                    all_ref_features = compose_image_features(model_engine.module, all_ref_features)
                     ref_hard_negative_features = all_ref_features.view(images_in_batch, num_ref_negatives, -1)
                     del all_ref_images, all_ref_features
 
@@ -1433,6 +1505,7 @@ def clip_finetune_single_text_ance(
                     ).to(device, non_blocking=True)
                     all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
                     all_pi_features = F.normalize(all_pi_features, dim=-1)
+                    all_pi_features = compose_image_features(model_engine.module, all_pi_features)
                     partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
                     del all_pi_images, all_pi_features
 
@@ -1481,8 +1554,11 @@ def clip_finetune_single_text_ance(
             if is_main_process(dist_info):
                 model_engine.eval()
                 torch.cuda.empty_cache()
-                val_index_features, val_index_names = extract_clip_index_features(
-                    classic_val_dataset, model_engine.module, device=device
+                val_index_features, val_index_names, reference_index_features = extract_clip_index_features(
+                    classic_val_dataset,
+                    model_engine.module,
+                    device=device,
+                    return_raw_features=True,
                 )
                 if dataset_key == "cirr":
                     results = compute_cirr_val_metrics_clip(
@@ -1492,6 +1568,7 @@ def clip_finetune_single_text_ance(
                         val_index_features,
                         val_index_names,
                         device=device,
+                        reference_index_features=reference_index_features,
                     )
                     group_r1, group_r2, group_r3, r1, r5, r10, r50 = results
                     results_dict = {
@@ -1516,6 +1593,7 @@ def clip_finetune_single_text_ance(
                         val_index_names,
                         device=device,
                         dataset_label=dataset_label,
+                        reference_index_features=reference_index_features,
                     )
                     r1, r10, r50 = results
                     results_dict = {
@@ -1526,7 +1604,7 @@ def clip_finetune_single_text_ance(
                     }
                 print(json.dumps(results_dict, indent=4))
 
-                del val_index_features, val_index_names
+                del val_index_features, val_index_names, reference_index_features
                 torch.cuda.empty_cache()
 
                 log_dict = {"epoch": epoch}
@@ -1599,9 +1677,10 @@ if __name__ == "__main__":
     parser.add_argument("--init-temperature", default=0.03, type=float,
                         help="Initial value for the learnable CLIP temperature.")
     parser.add_argument("--fusion-type", default="adaptive_residual", type=str,
-                        choices=["sum", "adaptive_residual"])
+                        choices=["sum", "adaptive_residual", "cross_attention"])
     parser.add_argument("--fusion-hidden-dim", default=None, type=int)
     parser.add_argument("--fusion-dropout", default=0.1, type=float)
+    parser.add_argument("--fusion-num-heads", default=8, type=int)
     parser.add_argument("--lora-learning-rate", default=5e-5, type=float)
     parser.add_argument("--fusion-learning-rate", default=1e-4, type=float)
     parser.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true")
@@ -1666,6 +1745,7 @@ if __name__ == "__main__":
         "fusion_type": args.fusion_type,
         "fusion_hidden_dim": args.fusion_hidden_dim,
         "fusion_dropout": args.fusion_dropout,
+        "fusion_num_heads": args.fusion_num_heads,
         "lora_learning_rate": args.lora_learning_rate,
         "fusion_learning_rate": args.fusion_learning_rate,
         "gradient_checkpointing": args.gradient_checkpointing,
