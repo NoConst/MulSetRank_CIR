@@ -7,7 +7,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 nohup deepspeed --num_gpus=5 src/deepspeed_clip_a
     --num-epochs 8 \
     --learning-rate 5e-5 \
     --lora-learning-rate 5e-5 \
-    --fusion-learning-rate 2e-5 \
+    --fusion-learning-rate 5e-5 \
     --ance-num-negatives 3 \
     --listwise-weight 0.5 \
     --use-lora \
