@@ -21,7 +21,7 @@ from tqdm import tqdm
 from pathlib import Path
 import logging
 
-from cir_fusion import compose_image_features, compose_query_features
+from cir_fusion import compose_image_features, compose_query_features, get_model_cir_fusion
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -622,6 +622,328 @@ def compute_clip_ance_listwise_loss(
     log_pred_probs = F.log_softmax(logits, dim=-1)
 
     return F.kl_div(log_pred_probs, target_probs, reduction="batchmean")
+
+
+def _compute_intent_features_from_multi_token(
+    fusion_module,
+    image_features: torch.Tensor,
+    text_features_list: List[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Build one retrieval-space query feature per intent from a shared
+    multi-intent cross-attention token sequence.
+
+    Each per-intent feature reuses the same base/residual/gate equations as
+    CrossAttentionFusion.forward(). The only difference is that its context is
+    sliced from the full multi-intent token sequence, so each intent is still
+    aware of the other intents through the shared attention distribution.
+
+    Args:
+        fusion_module: CrossAttentionFusion 实例
+        image_features: [1, D] 单张参考图像特征（按样本调用）
+        text_features_list: list of [1, D]，每个元素是一个单意图文本特征
+
+    Returns:
+        intent_features: [1, k, D]，k 为单意图个数，每个意图的检索空间输出
+    """
+    module_param = next(fusion_module.parameters())
+    compute_device = module_param.device
+    compute_dtype = module_param.dtype
+
+    image_features = F.normalize(
+        image_features.to(device=compute_device, dtype=compute_dtype),
+        dim=-1,
+    )
+
+    normalized_text_features = []
+    product_features_list = []
+    token_blocks = [fusion_module.image_proj(image_features)]
+    modality_ids = [0]
+
+    for text_features in text_features_list:
+        text_features = F.normalize(
+            text_features.to(device=compute_device, dtype=compute_dtype),
+            dim=-1,
+        )
+        product_features = image_features * text_features
+        delta_features = image_features - text_features
+
+        normalized_text_features.append(text_features)
+        product_features_list.append(product_features)
+        token_blocks.extend(
+            [
+                fusion_module.text_proj(text_features),
+                fusion_module.product_proj(product_features),
+                fusion_module.delta_proj(delta_features),
+            ]
+        )
+        modality_ids.extend([1, 2, 3])
+
+    tokens = torch.stack(token_blocks, dim=1)  # [1, 1+3k, D]
+    modality_ids_tensor = torch.tensor(modality_ids, device=compute_device, dtype=torch.long)
+    modality_embeddings = fusion_module.modality_embeddings.index_select(0, modality_ids_tensor)
+    tokens = fusion_module.token_norm(tokens + modality_embeddings.unsqueeze(0))
+
+    query_token = fusion_module.query_token.expand(image_features.shape[0], -1, -1)
+    query_token = query_token + fusion_module.image_proj(image_features).unsqueeze(1)
+
+    _, attn_weights = fusion_module.cross_attn(
+        query_token,
+        tokens,
+        tokens,
+        need_weights=True,
+        average_attn_weights=True,
+    )
+    attn_weights = attn_weights.squeeze(1)  # [1, 1+3k]
+
+    intent_contexts = []
+    for i in range(len(text_features_list)):
+        start = 1 + 3 * i
+        token_indices = torch.tensor([0, start, start + 1, start + 2], device=compute_device)
+        w = attn_weights.index_select(1, token_indices).unsqueeze(-1)  # [1, 4, 1]
+        v = tokens.index_select(1, token_indices)  # [1, 4, D]
+        context = (w * v).sum(dim=1)  # [1, D]
+        intent_contexts.append(fusion_module.context_norm(context))
+
+    repeated_image_features = image_features.expand(len(text_features_list), -1)
+    text_features = torch.cat(normalized_text_features, dim=0)
+    product_features = torch.cat(product_features_list, dim=0)
+    intent_contexts = torch.cat(intent_contexts, dim=0)
+
+    residual_input = torch.cat(
+        [repeated_image_features, text_features, product_features, intent_contexts],
+        dim=-1,
+    )
+    residual = fusion_module.residual_mlp(residual_input)
+    gate = torch.sigmoid(fusion_module.gate_mlp(residual_input))
+
+    base = (
+        fusion_module.image_residual_weight * repeated_image_features
+        + fusion_module.text_residual_weight * text_features
+    )
+    intent_features = base + fusion_module.update_scale * gate * residual
+    intent_features = F.normalize(intent_features, dim=-1)
+
+    return intent_features.unsqueeze(0)
+
+
+def compute_intent_consistency_loss(
+    model,
+    tokenizer,
+    ref_features: torch.Tensor,
+    query_features: torch.Tensor,
+    input_captions: List[str],
+    single_intent_map: Optional[dict],
+    device: torch.device,
+    global_consistency_weight: float = 0.5,
+    global_consistency_temperature: float = 0.2,
+    consistency_epsilon: float = 0.05,
+) -> torch.Tensor:
+    """
+    基于 cross-attention fusioner 的意图一致性损失。
+
+    - 单意图 A_i 的修改：直接定义为完整 fusion 输出 f(A_i, I)
+    - 复杂查询 T=(A_1,...,A_k) 中 A_i 的修改：在共享 multi-intent token
+      attention 场景下，为 A_i 构造 context，并复用 forward 的 base/residual/gate
+      路径得到检索空间输出
+
+    约束：单意图独立融合后的向量，应与它在复杂查询的 multi-token cross-attn
+    中得到的检索空间输出一致。这样保证了每个意图的“作用”不被其他意图扭曲。
+    同时，用完整查询 feature 作为 detached teacher，约束 multi-intent 中各单意图
+    feature 的相关性加权组合能够解释完整查询 feature。
+    局部项使用原论文形式的 one-sided ReLU hinge；加权全局项使用 cosine-distance
+    ReLU hinge。
+
+    只在 fusion module 为 cross-attention 结构时生效；其他 fusion 类型返回 0。
+    """
+    if single_intent_map is None or len(single_intent_map) == 0:
+        return torch.zeros((), device=device)
+
+    fusion_module = get_model_cir_fusion(model)
+    if fusion_module is None or getattr(fusion_module, "cross_attn", None) is None:
+        return torch.zeros((), device=device)
+
+    multi_indices: List[int] = []
+    multi_intent_texts: List[List[str]] = []
+    for i, cap in enumerate(input_captions):
+        intents = single_intent_map.get(cap)
+        if isinstance(intents, list) and len(intents) >= 2:
+            multi_indices.append(i)
+            multi_intent_texts.append(intents)
+
+    if len(multi_indices) == 0:
+        return torch.zeros((), device=device)
+
+    flat_intents: List[str] = []
+    for intents in multi_intent_texts:
+        flat_intents.extend(intents)
+
+    if len(flat_intents) == 0:
+        return torch.zeros((), device=device)
+
+    inputs = tokenizer(
+        flat_intents,
+        padding=True,
+        truncation=True,
+        max_length=77,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.cuda.amp.autocast():
+        single_text_features = model.get_text_features(**inputs)
+        single_text_features = F.normalize(single_text_features, dim=-1)
+
+        # 为每个单意图复用对应的 reference image 特征
+        repeat_indices: List[int] = []
+        for idx, intents in zip(multi_indices, multi_intent_texts):
+            repeat_indices.extend([idx] * len(intents))
+        repeated_ref_features = ref_features[repeat_indices]
+
+        single_query_features = fusion_module(repeated_ref_features, single_text_features)
+
+    global_consistency_weight = float(global_consistency_weight)
+    global_consistency_temperature = max(float(global_consistency_temperature), 1e-6)
+    consistency_epsilon = max(float(consistency_epsilon), 0.0)
+
+    # 逐样本计算 multi-token per-intent outputs 并施加局部+加权全局一致性约束
+    losses = []
+    offset = 0
+    for j, idx in enumerate(multi_indices):
+        num_intents = len(multi_intent_texts[j])
+        end = offset + num_intents
+
+        # 单意图独立 fusion 输出: [k, D]
+        single_queries = single_query_features[offset:end]
+
+        # 构造 multi-token 场景，提取每个意图在检索空间中的输出
+        img_feat = ref_features[idx:idx + 1]  # [1, D]
+        text_list = [single_text_features[offset + i:offset + i + 1] for i in range(num_intents)]
+        multi_intent_features = _compute_intent_features_from_multi_token(
+            fusion_module, img_feat, text_list
+        )  # [1, k, D]
+        multi_intent_features = multi_intent_features.squeeze(0)  # [k, D]
+
+        # ---------- 局部一致性：ReLU(CrossAttn(I,T_NP_i) - CrossAttn(I,NP_i) - eps) ----------
+        # Here multi_intent_features is the in-context CrossAttn output, and
+        # single_queries is the isolated single-intent CrossAttn output.
+        loss_local = F.relu(
+            multi_intent_features - single_queries - consistency_epsilon
+        ).mean()
+
+        if global_consistency_weight > 0.0:
+            # ---------- 全局一致性：完整查询 feature ≈ 单意图 feature 的相关性加权组合 ----------
+            full_query_teacher = F.normalize(query_features[idx].detach(), dim=-1)
+            with torch.no_grad():
+                multi_norm = F.normalize(multi_intent_features, dim=-1)
+                intent_sims = (multi_norm * full_query_teacher.unsqueeze(0)).sum(dim=-1)
+                intent_weights = F.softmax(
+                    intent_sims / global_consistency_temperature,
+                    dim=0,
+                )
+
+            weighted_features = (intent_weights.unsqueeze(-1) * multi_intent_features).sum(dim=0)
+            weighted_features_norm = F.normalize(weighted_features.unsqueeze(0), dim=-1).squeeze(0)
+            cos_sim_global = (full_query_teacher * weighted_features_norm).sum().clamp(min=-1.0, max=1.0)
+            loss_global = F.relu((1.0 - cos_sim_global) - consistency_epsilon)
+            losses.append(loss_local + global_consistency_weight * loss_global)
+        else:
+            losses.append(loss_local)
+        offset = end
+
+    loss = torch.stack(losses).mean()
+    return loss
+
+
+def compute_intent_orthogonality_loss(
+    model,
+    tokenizer,
+    ref_features: torch.Tensor,
+    query_features: torch.Tensor,
+    input_captions: List[str],
+    single_intent_map: Optional[dict],
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    意图间软正交损失（Soft Orthogonality Loss）。
+
+    对于多意图查询 T=(A_1, ..., A_k)（k >= 2），约束各个单意图在复杂查询中
+    产生的 retrieval-space edit direction 尽可能相互正交：
+
+        <delta(A_i in T), delta(A_j in T)>  ≈  0    (i != j)
+
+    这样不同意图的修改方向相互解耦，每个意图的作用不会被其他意图带偏。
+    使用 cosine similarity 的平方作为惩罚项，保证方向上的独立性。
+
+    只在 fusion module 为 cross-attention 结构时生效；其他 fusion 类型返回 0。
+    """
+    if single_intent_map is None or len(single_intent_map) == 0:
+        return torch.zeros((), device=device)
+
+    fusion_module = get_model_cir_fusion(model)
+    if fusion_module is None or getattr(fusion_module, "cross_attn", None) is None:
+        return torch.zeros((), device=device)
+
+    multi_indices: List[int] = []
+    multi_intent_texts: List[List[str]] = []
+    for i, cap in enumerate(input_captions):
+        intents = single_intent_map.get(cap)
+        if isinstance(intents, list) and len(intents) >= 2:
+            multi_indices.append(i)
+            multi_intent_texts.append(intents)
+
+    if len(multi_indices) == 0:
+        return torch.zeros((), device=device)
+
+    flat_intents: List[str] = []
+    for intents in multi_intent_texts:
+        flat_intents.extend(intents)
+
+    if len(flat_intents) == 0:
+        return torch.zeros((), device=device)
+
+    inputs = tokenizer(
+        flat_intents,
+        padding=True,
+        truncation=True,
+        max_length=77,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.cuda.amp.autocast():
+        single_text_features = model.get_text_features(**inputs)
+        single_text_features = F.normalize(single_text_features, dim=-1)
+
+    losses = []
+    offset = 0
+    for j, idx in enumerate(multi_indices):
+        num_intents = len(multi_intent_texts[j])
+        end = offset + num_intents
+
+        # 构造 multi-token 场景，提取每个意图在检索空间中的输出
+        img_feat = ref_features[idx:idx + 1]  # [1, D]
+        text_list = [single_text_features[offset + i:offset + i + 1] for i in range(num_intents)]
+        multi_intent_features = _compute_intent_features_from_multi_token(
+            fusion_module, img_feat, text_list
+        )  # [1, k, D]
+        multi_intent_features = multi_intent_features.squeeze(0)  # [k, D]
+
+        # 计算 retrieval-space edit directions 两两之间的 cosine similarity
+        image_only_feature = fusion_module.compose_image(img_feat).squeeze(0)
+        intent_deltas = multi_intent_features - image_only_feature.unsqueeze(0)
+        deltas_norm = F.normalize(intent_deltas, dim=-1)  # [k, D]
+        gram = torch.mm(deltas_norm, deltas_norm.t())  # [k, k]
+
+        # 取上三角（i < j）的 cos^2 作为软正交惩罚
+        mask = torch.triu(torch.ones_like(gram), diagonal=1).bool()
+        cos_sims = gram[mask]
+        if cos_sims.numel() > 0:
+            losses.append((cos_sims ** 2).mean())
+
+        offset = end
+
+    if len(losses) == 0:
+        return torch.zeros((), device=device)
+    return torch.stack(losses).mean()
 
 
 def compute_clip_ance_loss(

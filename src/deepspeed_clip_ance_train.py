@@ -55,6 +55,8 @@ from utils import collate_fn, update_train_running_results, set_train_bar_descri
 from clip_ance_utils import (
     CLIPHardNegativeMiner,
     compute_clip_ance_loss,
+    compute_intent_consistency_loss,
+    compute_intent_orthogonality_loss,
     enable_model_logit_scale_training,
     get_model_logit_scale,
     get_similarity_scale,
@@ -694,6 +696,12 @@ def clip_finetune_fiq_ance(
     ref_ance_weight = float(kwargs.get("ref_ance_weight", 1.0))
     partial_intent_weight = float(kwargs.get("partial_intent_weight", 0.75))
     partial_intent_num_negatives = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+    single_intent_queries_path = kwargs.get("single_intent_queries_path", None)
+    intent_consistency_weight = float(kwargs.get("intent_consistency_weight", 0.0))
+    intent_orthogonality_weight = float(kwargs.get("intent_orthogonality_weight", 0.0))
+    intent_global_consistency_weight = float(kwargs.get("intent_global_consistency_weight", 0.5))
+    intent_global_consistency_temperature = float(kwargs.get("intent_global_consistency_temperature", 0.2))
+    intent_consistency_epsilon = float(kwargs.get("intent_consistency_epsilon", 0.05))
     use_ranked_training = listwise_weight > 0.0
     fashioniq_val_split_mode = kwargs.get("fashioniq_val_split_mode", "original-split")
 
@@ -743,6 +751,12 @@ def clip_finetune_fiq_ance(
             "listwise_weight": listwise_weight,
             "partial_intent_num_negatives": partial_intent_num_negatives,
             "partial_intent_weight": partial_intent_weight,
+            "single_intent_queries_path": single_intent_queries_path,
+            "intent_consistency_weight": intent_consistency_weight,
+            "intent_orthogonality_weight": intent_orthogonality_weight,
+            "intent_global_consistency_weight": intent_global_consistency_weight,
+            "intent_global_consistency_temperature": intent_global_consistency_temperature,
+            "intent_consistency_epsilon": intent_consistency_epsilon,
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -818,6 +832,17 @@ def clip_finetune_fiq_ance(
         with open(partial_intent_queries_path, "r") as f:
             partial_intent_queries = json.load(f)
         logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
+
+    # Load single-intent decomposition for intent losses
+    single_intent_map = None
+    if (
+        (intent_consistency_weight > 0.0 or intent_orthogonality_weight > 0.0)
+        and single_intent_queries_path
+        and os.path.exists(single_intent_queries_path)
+    ):
+        with open(single_intent_queries_path, "r") as f:
+            single_intent_map = json.load(f)
+        logger.info(f"Loaded {len(single_intent_map)} single-intent decompositions from {single_intent_queries_path}")
 
     # DistributedSampler for training
     if dist_info["enabled"]:
@@ -1055,6 +1080,35 @@ def clip_finetune_fiq_ance(
                     logit_scale=train_logit_scale,
                 )
 
+            # Intent losses are independent of the ANCE/listwise branch and
+            # should also apply to plain in-batch contrastive training.
+            if intent_consistency_weight > 0.0 and single_intent_map is not None:
+                ic_loss = compute_intent_consistency_loss(
+                    model=model_engine.module,
+                    tokenizer=tokenizer,
+                    ref_features=ref_features,
+                    query_features=query_features,
+                    input_captions=input_captions,
+                    single_intent_map=single_intent_map,
+                    device=device,
+                    global_consistency_weight=intent_global_consistency_weight,
+                    global_consistency_temperature=intent_global_consistency_temperature,
+                    consistency_epsilon=intent_consistency_epsilon,
+                )
+                loss = loss + intent_consistency_weight * ic_loss
+
+            if intent_orthogonality_weight > 0.0 and single_intent_map is not None:
+                io_loss = compute_intent_orthogonality_loss(
+                    model=model_engine.module,
+                    tokenizer=tokenizer,
+                    ref_features=ref_features,
+                    query_features=query_features,
+                    input_captions=input_captions,
+                    single_intent_map=single_intent_map,
+                    device=device,
+                )
+                loss = loss + intent_orthogonality_weight * io_loss
+
             loss_for_logging = loss.detach().float().cpu()
 
             # DeepSpeed handles backward, gradient accumulation, and optimizer step
@@ -1198,6 +1252,12 @@ def clip_finetune_single_text_ance(
     ref_ance_weight = float(kwargs.get("ref_ance_weight", 1.0))
     partial_intent_weight = float(kwargs.get("partial_intent_weight", 0.75))
     partial_intent_num_negatives = kwargs.get("partial_intent_num_negatives", ance_num_negatives)
+    single_intent_queries_path = kwargs.get("single_intent_queries_path", None)
+    intent_consistency_weight = float(kwargs.get("intent_consistency_weight", 0.0))
+    intent_orthogonality_weight = float(kwargs.get("intent_orthogonality_weight", 0.0))
+    intent_global_consistency_weight = float(kwargs.get("intent_global_consistency_weight", 0.5))
+    intent_global_consistency_temperature = float(kwargs.get("intent_global_consistency_temperature", 0.2))
+    intent_consistency_epsilon = float(kwargs.get("intent_consistency_epsilon", 0.05))
     use_ranked_training = listwise_weight > 0.0
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
@@ -1246,6 +1306,12 @@ def clip_finetune_single_text_ance(
             "listwise_weight": listwise_weight,
             "partial_intent_num_negatives": partial_intent_num_negatives,
             "partial_intent_weight": partial_intent_weight,
+            "single_intent_queries_path": single_intent_queries_path,
+            "intent_consistency_weight": intent_consistency_weight,
+            "intent_orthogonality_weight": intent_orthogonality_weight,
+            "intent_global_consistency_weight": intent_global_consistency_weight,
+            "intent_global_consistency_temperature": intent_global_consistency_temperature,
+            "intent_consistency_epsilon": intent_consistency_epsilon,
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -1300,6 +1366,17 @@ def clip_finetune_single_text_ance(
         with open(partial_intent_queries_path, "r") as f:
             partial_intent_queries = json.load(f)
         logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
+
+    # Load single-intent decomposition for intent losses
+    single_intent_map = None
+    if (
+        (intent_consistency_weight > 0.0 or intent_orthogonality_weight > 0.0)
+        and single_intent_queries_path
+        and os.path.exists(single_intent_queries_path)
+    ):
+        with open(single_intent_queries_path, "r") as f:
+            single_intent_map = json.load(f)
+        logger.info(f"Loaded {len(single_intent_map)} single-intent decompositions from {single_intent_queries_path}")
 
     if dist_info["enabled"]:
         train_sampler = DistributedSampler(relative_train_dataset, shuffle=True, drop_last=True)
@@ -1522,6 +1599,35 @@ def clip_finetune_single_text_ance(
                     logit_scale=train_logit_scale,
                 )
 
+            # Intent losses are independent of the ANCE/listwise branch and
+            # should also apply to plain in-batch contrastive training.
+            if intent_consistency_weight > 0.0 and single_intent_map is not None:
+                ic_loss = compute_intent_consistency_loss(
+                    model=model_engine.module,
+                    tokenizer=tokenizer,
+                    ref_features=ref_features,
+                    query_features=query_features,
+                    input_captions=input_captions,
+                    single_intent_map=single_intent_map,
+                    device=device,
+                    global_consistency_weight=intent_global_consistency_weight,
+                    global_consistency_temperature=intent_global_consistency_temperature,
+                    consistency_epsilon=intent_consistency_epsilon,
+                )
+                loss = loss + intent_consistency_weight * ic_loss
+
+            if intent_orthogonality_weight > 0.0 and single_intent_map is not None:
+                io_loss = compute_intent_orthogonality_loss(
+                    model=model_engine.module,
+                    tokenizer=tokenizer,
+                    ref_features=ref_features,
+                    query_features=query_features,
+                    input_captions=input_captions,
+                    single_intent_map=single_intent_map,
+                    device=device,
+                )
+                loss = loss + intent_orthogonality_weight * io_loss
+
             loss_for_logging = loss.detach().float().cpu()
 
             model_engine.backward(loss)
@@ -1668,6 +1774,18 @@ if __name__ == "__main__":
     parser.add_argument("--listwise-weight", default=0.2, type=float)
     parser.add_argument("--partial-intent-queries-path", type=str, default=None,
                         help="Path to partial intent queries JSON file")
+    parser.add_argument("--single-intent-queries-path", type=str, default=None,
+                        help="Path to single intent decomposition JSON file (e.g., fiq_single_intent_queries.json)")
+    parser.add_argument("--intent-consistency-weight", type=float, default=0.0,
+                        help="Weight for the intent consistency loss on multi-intent queries (cross-attn only).")
+    parser.add_argument("--intent-orthogonality-weight", type=float, default=0.0,
+                        help="Weight for the soft orthogonality loss between intents in multi-intent queries (cross-attn only).")
+    parser.add_argument("--intent-global-consistency-weight", type=float, default=0.5,
+                        help="Relative weight of the weighted global consistency term inside intent consistency loss.")
+    parser.add_argument("--intent-global-consistency-temperature", type=float, default=0.2,
+                        help="Softmax temperature for weighting single-intent features in global consistency.")
+    parser.add_argument("--intent-consistency-epsilon", type=float, default=0.05,
+                        help="Hinge margin epsilon for local/global intent consistency cosine distance.")
 
     # LoRA
     parser.add_argument("--use-lora", action="store_true")
@@ -1738,6 +1856,12 @@ if __name__ == "__main__":
         "partial_intent_weight": args.partial_intent_weight,
         "listwise_weight": args.listwise_weight,
         "partial_intent_queries_path": args.partial_intent_queries_path,
+        "single_intent_queries_path": args.single_intent_queries_path,
+        "intent_consistency_weight": args.intent_consistency_weight,
+        "intent_orthogonality_weight": args.intent_orthogonality_weight,
+        "intent_global_consistency_weight": args.intent_global_consistency_weight,
+        "intent_global_consistency_temperature": args.intent_global_consistency_temperature,
+        "intent_consistency_epsilon": args.intent_consistency_epsilon,
         "use_lora": args.use_lora,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,

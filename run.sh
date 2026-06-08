@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 nohup deepspeed --num_gpus=5 src/deepspeed_clip_ance_train.py \
+nohup deepspeed --include localhost:0,1,2,3,4 src/deepspeed_clip_ance_train.py \
     --dataset fashionIQ \
     --clip-model-name "ViT-H/14" \
     --batch-size 8 \
@@ -21,7 +21,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 nohup deepspeed --num_gpus=5 src/deepspeed_clip_a
     --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
     --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_fiq_H_14_partial_intent_all_listwise_loss_sum.log &
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 nohup deepspeed --num_gpus=4 src/deepspeed_clip_ance_train.py \
+nohup deepspeed --include localhost:0,1,2,3 src/deepspeed_clip_ance_train.py \
     --dataset cirr \
     --clip-model-name "ViT-H/14" \
     --batch-size 8 \
