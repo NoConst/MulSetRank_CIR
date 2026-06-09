@@ -518,9 +518,13 @@ def compute_clip_ance_listwise_loss(
     **legacy_kwargs,
 ) -> torch.Tensor:
     """
-    Listwise ranking loss over the ordered candidate list:
+    ListNet top-one ranking loss over the ordered candidate list:
     target image > hard negatives > partial-intent negatives >
     reference-image negatives > in-batch samples.
+
+    The target distribution is built from manually assigned group-level
+    relevance scores while the prediction distribution comes from query-candidate
+    similarities.
     """
     device = query_features.device
 
@@ -619,7 +623,7 @@ def compute_clip_ance_listwise_loss(
     target_probs = F.softmax(target_scores, dim=-1)
     log_pred_probs = F.log_softmax(logits, dim=-1)
 
-    return F.kl_div(log_pred_probs, target_probs, reduction="batchmean")
+    return -(target_probs * log_pred_probs).sum(dim=-1).mean()
 
 
 def _compute_intent_features_from_multi_token(
