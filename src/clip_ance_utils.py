@@ -243,7 +243,7 @@ class CLIPHardNegativeMiner:
         return topk_sim, topk_idx
     
     def _get_positive_indices_tensor(self, positive_names: List[str], device: torch.device) -> torch.Tensor:
-        """将positive_names转换为tensor indices（批量操作）"""
+        """Convert positive_names to tensor indices in batch."""
         indices = torch.tensor(
             [self.name_to_idx.get(name, -1) for name in positive_names],
             dtype=torch.long,
@@ -259,7 +259,7 @@ class CLIPHardNegativeMiner:
         additional_exclude_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[List[str]]]:
         """
-        向量化的硬负样本挖掘 - 最小化CPU操作
+        Vectorized hard-negative mining with minimal CPU work.
         
         Returns:
             hard_negative_indices: [B, num_negatives] on GPU
@@ -272,18 +272,18 @@ class CLIPHardNegativeMiner:
         query_features = F.normalize(query_features.to(device), dim=-1)
         batch_size = query_features.shape[0]
         
-        # 1. GPU上搜索top-k候选
+        # 1. Search top-k candidates on GPU.
         _, topk_indices = self._search_topk(query_features, self.topk_candidates)
         # topk_indices: [B, topk_candidates] on GPU
         
-        # 2. 获取positive indices (GPU tensor)
+        # 2. Get positive indices as a GPU tensor.
         positive_indices = self._get_positive_indices_tensor(positive_names, device)  # [B]
         
-        # 3. 在GPU上创建mask排除正样本
+        # 3. Build a GPU mask to exclude positive samples.
         # positive_indices: [B, 1], topk_indices: [B, topk_candidates]
         positive_mask = (topk_indices == positive_indices.unsqueeze(1))  # [B, topk_candidates]
         
-        # 4. 如果有exclude_reference_names，也排除
+        # 4. Also exclude reference names when provided.
         if exclude_reference_names:
             exclude_indices = self._get_positive_indices_tensor(exclude_reference_names, device)
             exclude_mask = (topk_indices == exclude_indices.unsqueeze(1))
@@ -299,20 +299,17 @@ class CLIPHardNegativeMiner:
             ) & valid_additional.unsqueeze(1)
             positive_mask = positive_mask | additional_mask.any(dim=-1)
         
-        # 5. 将正样本位置的值设为一个很大的负数（这样它们在排序后会排到最后）
-        # 使用similarity值来重新排序，但我们只需要indices
-        # 简单方法：直接过滤
+        # 5. Filter out excluded indices directly.
         
-        # 6. 向量化选择：使用masked_fill和gather
-        # 将要排除的位置填充为-1
+        # 6. Mark excluded positions as -1.
         filtered_indices = topk_indices.clone()
         filtered_indices[positive_mask] = -1
         
-        # 7. 对每个样本，选择前num_negatives个非-1的索引
-        # 由于topk已经按相似度排序，我们只需要取前面的非-1值
+        # 7. For each sample, take the first num_negatives non--1 indices.
+        # topk is already similarity-sorted, so the first valid entries are enough.
         hard_negative_indices = torch.zeros(batch_size, self.num_negatives, dtype=torch.long, device=device)
         
-        # 这里仍需要循环，但操作都在GPU tensor上，减少CPU开销
+        # This still loops per sample, but the work stays on GPU tensors.
         for i in range(batch_size):
             valid_mask = filtered_indices[i] != -1
             valid_indices = filtered_indices[i][valid_mask]
@@ -320,9 +317,9 @@ class CLIPHardNegativeMiner:
             if len(valid_indices) >= self.num_negatives:
                 hard_negative_indices[i] = valid_indices[:self.num_negatives]
             else:
-                # 需要随机补充
+                # Backfill if there are not enough valid candidates.
                 hard_negative_indices[i, :len(valid_indices)] = valid_indices
-                # 随机采样补充（在GPU上）
+                # Randomly sample the remaining entries on GPU.
                 n_needed = self.num_negatives - len(valid_indices)
                 random_indices = torch.randint(
                     0, len(self.target_names), (n_needed,), 
@@ -330,7 +327,7 @@ class CLIPHardNegativeMiner:
                 )
                 hard_negative_indices[i, len(valid_indices):] = random_indices
         
-        # 8. 转换为names（这步必须在CPU上，但indices已经准备好了）
+        # 8. Convert to names on CPU after all indices are ready.
         indices_cpu = hard_negative_indices.cpu().numpy()
         hard_negative_names = [
             [self.target_names[idx] for idx in indices_cpu[i]]
@@ -348,7 +345,7 @@ class CLIPHardNegativeMiner:
         return_names: bool = True
     ) -> Union[Tuple[torch.Tensor, List[List[str]]], Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Mine hard negatives - 使用向量化版本
+        Mine hard negatives using the vectorized implementation.
         """
         indices, names = self.mine_hard_negatives_vectorized(
             query_features, positive_names, exclude_reference_names, additional_exclude_indices
@@ -372,18 +369,19 @@ class CLIPHardNegativeMiner:
         tokenizer=None
     ) -> Tuple[torch.Tensor, List[List[str]]]:
         """
-        使用预生成的 partial intent query + reference image 挖掘负样本。
+        Mine negatives using pregenerated partial-intent queries and reference images.
 
-        对每个样本，将 partial intent text 编码后与 ref image features 组合，
-        在索引中检索最近邻作为负样本。
+        For each sample, encode the partial-intent text, compose it with the
+        reference image features, and retrieve nearest neighbors from the index
+        as negatives.
 
         Args:
-            partial_intent_texts: 每个样本对应的 partial intent 文本
+            partial_intent_texts: Partial-intent text for each sample.
             ref_features: [B, D] reference image features
-            positive_names: 正样本名称列表
-            hard_negative_indices: [B, N] 已有硬负样本索引（排除用）
-            num_negatives: 每个样本需要的负样本数量
-            clip_model: CLIP 模型
+            positive_names: Positive sample names.
+            hard_negative_indices: [B, N] existing hard-negative indices to exclude.
+            num_negatives: Number of negatives needed for each sample.
+            clip_model: CLIP model.
             tokenizer: CLIP tokenizer
 
         Returns:
@@ -639,12 +637,13 @@ def _compute_intent_features_from_multi_token(
     aware of the other intents through the shared attention distribution.
 
     Args:
-        fusion_module: CrossAttentionFusion 实例
-        image_features: [1, D] 单张参考图像特征（按样本调用）
-        text_features_list: list of [1, D]，每个元素是一个单意图文本特征
+        fusion_module: CrossAttentionFusion instance.
+        image_features: [1, D] reference image feature for one sample.
+        text_features_list: list of [1, D], one text feature per single intent.
 
     Returns:
-        intent_features: [1, k, D]，k 为单意图个数，每个意图的检索空间输出
+        intent_features: [1, k, D], where k is the number of single intents and
+        each slice is a retrieval-space output for one intent.
     """
     module_param = next(fusion_module.parameters())
     compute_device = module_param.device
@@ -740,21 +739,23 @@ def compute_intent_consistency_loss(
     consistency_epsilon: float = 0.05,
 ) -> torch.Tensor:
     """
-    基于 cross-attention fusioner 的意图一致性损失。
+    Intent consistency loss based on the cross-attention fusion head.
 
-    - 单意图 A_i 的修改：直接定义为完整 fusion 输出 f(A_i, I)
-    - 复杂查询 T=(A_1,...,A_k) 中 A_i 的修改：在共享 multi-intent token
-      attention 场景下，为 A_i 构造 context，并复用 forward 的 base/residual/gate
-      路径得到检索空间输出
+    - The edit for a single intent A_i is defined as the full fusion output
+      f(A_i, I).
+    - For A_i inside a complex query T=(A_1,...,A_k), build its context under a
+      shared multi-intent token attention setup, then reuse the forward
+      base/residual/gate path to obtain a retrieval-space output.
 
-    约束：单意图独立融合后的向量，应与它在复杂查询的 multi-token cross-attn
-    中得到的检索空间输出一致。这样保证了每个意图的“作用”不被其他意图扭曲。
-    同时，用完整查询 feature 作为 detached teacher，约束 multi-intent 中各单意图
-    feature 的相关性加权组合能够解释完整查询 feature。
-    局部项使用原论文形式的 one-sided ReLU hinge；加权全局项使用 cosine-distance
-    ReLU hinge。
+    The isolated single-intent fusion vector should match the retrieval-space
+    output obtained for the same intent inside the complex query's multi-token
+    cross-attention context. This keeps each intent from being distorted by the
+    others. At the same time, the full query feature is used as a detached
+    teacher so a relevance-weighted combination of per-intent features can
+    explain the full query feature. The local term uses a one-sided ReLU hinge,
+    and the weighted global term uses a cosine-distance ReLU hinge.
 
-    只在 fusion module 为 cross-attention 结构时生效；其他 fusion 类型返回 0。
+    Active only for cross-attention fusion modules; other fusion types return 0.
     """
     if single_intent_map is None or len(single_intent_map) == 0:
         return torch.zeros((), device=device)
@@ -793,7 +794,7 @@ def compute_intent_consistency_loss(
         single_text_features = model.get_text_features(**inputs)
         single_text_features = F.normalize(single_text_features, dim=-1)
 
-        # 为每个单意图复用对应的 reference image 特征
+        # Reuse the corresponding reference image feature for each single intent.
         repeat_indices: List[int] = []
         for idx, intents in zip(multi_indices, multi_intent_texts):
             repeat_indices.extend([idx] * len(intents))
@@ -805,17 +806,18 @@ def compute_intent_consistency_loss(
     global_consistency_temperature = max(float(global_consistency_temperature), 1e-6)
     consistency_epsilon = max(float(consistency_epsilon), 0.0)
 
-    # 逐样本计算 multi-token per-intent outputs 并施加局部+加权全局一致性约束
+    # Compute multi-token per-intent outputs sample by sample, then apply local
+    # and weighted global consistency constraints.
     losses = []
     offset = 0
     for j, idx in enumerate(multi_indices):
         num_intents = len(multi_intent_texts[j])
         end = offset + num_intents
 
-        # 单意图独立 fusion 输出: [k, D]
+        # Isolated single-intent fusion outputs: [k, D]
         single_queries = single_query_features[offset:end]
 
-        # 构造 multi-token 场景，提取每个意图在检索空间中的输出
+        # Build the multi-token setup and extract each intent's retrieval-space output.
         img_feat = ref_features[idx:idx + 1]  # [1, D]
         text_list = [single_text_features[offset + i:offset + i + 1] for i in range(num_intents)]
         multi_intent_features = _compute_intent_features_from_multi_token(
@@ -823,7 +825,7 @@ def compute_intent_consistency_loss(
         )  # [1, k, D]
         multi_intent_features = multi_intent_features.squeeze(0)  # [k, D]
 
-        # ---------- 局部一致性：ReLU(CrossAttn(I,T_NP_i) - CrossAttn(I,NP_i) - eps) ----------
+        # ---------- Local consistency: ReLU(CrossAttn(I,T_NP_i) - CrossAttn(I,NP_i) - eps) ----------
         # Here multi_intent_features is the in-context CrossAttn output, and
         # single_queries is the isolated single-intent CrossAttn output.
         loss_local = F.relu(
@@ -831,7 +833,7 @@ def compute_intent_consistency_loss(
         ).mean()
 
         if global_consistency_weight > 0.0:
-            # ---------- 全局一致性：完整查询 feature ≈ 单意图 feature 的相关性加权组合 ----------
+            # ---------- Global consistency: full query feature ~= weighted per-intent features ----------
             full_query_teacher = F.normalize(query_features[idx].detach(), dim=-1)
             with torch.no_grad():
                 multi_norm = F.normalize(multi_intent_features, dim=-1)
@@ -854,6 +856,32 @@ def compute_intent_consistency_loss(
     return loss
 
 
+def _compute_soft_orthogonality_loss(embeddings: torch.Tensor) -> torch.Tensor:
+    """
+    Soft orthogonality penalty:
+        2 / (K * (K - 1)) * sum_{i<j} (<e_i, e_j>)^2
+    after L2-normalizing embeddings along the feature dimension.
+    """
+    num_embeddings = embeddings.shape[0]
+    if num_embeddings < 2:
+        return embeddings.new_zeros(())
+
+    normalized_embeddings = F.normalize(embeddings.float(), p=2, dim=-1)
+    gram = torch.mm(normalized_embeddings, normalized_embeddings.t())
+    pair_mask = torch.triu(
+        torch.ones(
+            num_embeddings,
+            num_embeddings,
+            device=embeddings.device,
+            dtype=torch.bool,
+        ),
+        diagonal=1,
+    )
+    pairwise_inner_products = gram[pair_mask]
+    normalization = 2.0 / float(num_embeddings * (num_embeddings - 1))
+    return pairwise_inner_products.square().sum() * normalization
+
+
 def compute_intent_orthogonality_loss(
     model,
     tokenizer,
@@ -864,17 +892,21 @@ def compute_intent_orthogonality_loss(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    意图间软正交损失（Soft Orthogonality Loss）。
+    Soft orthogonality loss between intents.
 
-    对于多意图查询 T=(A_1, ..., A_k)（k >= 2），约束各个单意图在复杂查询中
-    产生的 retrieval-space edit direction 尽可能相互正交：
+    For a multi-intent query T=(A_1, ..., A_k) with k >= 2, encourage the
+    retrieval-space query features produced by the fusion head for each single
+    intent to be mutually orthogonal:
 
-        <delta(A_i in T), delta(A_j in T)>  ≈  0    (i != j)
+        <f(I, A_i), f(I, A_j)> ~= 0    (i != j)
 
-    这样不同意图的修改方向相互解耦，每个意图的作用不会被其他意图带偏。
-    使用 cosine similarity 的平方作为惩罚项，保证方向上的独立性。
+    This encourages query representations for different intents to be
+    disentangled, so one intent is less likely to be pulled by another. The
+    embeddings are first L2-normalized along the feature dimension, then the
+    differentiable soft orthogonality penalty is computed as:
+    2 / (K * (K - 1)) * sum_{i<j} (<e_i, e_j>)^2
 
-    只在 fusion module 为 cross-attention 结构时生效；其他 fusion 类型返回 0。
+    Active only for cross-attention fusion modules; other fusion types return 0.
     """
     if single_intent_map is None or len(single_intent_map) == 0:
         return torch.zeros((), device=device)
@@ -913,31 +945,23 @@ def compute_intent_orthogonality_loss(
         single_text_features = model.get_text_features(**inputs)
         single_text_features = F.normalize(single_text_features, dim=-1)
 
+        repeat_indices: List[int] = []
+        for idx, intents in zip(multi_indices, multi_intent_texts):
+            repeat_indices.extend([idx] * len(intents))
+        repeated_ref_features = ref_features[repeat_indices]
+
+        # Isolated single-intent fusion outputs: [sum_k, D]
+        single_query_features = fusion_module(repeated_ref_features, single_text_features)
+
     losses = []
     offset = 0
-    for j, idx in enumerate(multi_indices):
+    for j in range(len(multi_indices)):
         num_intents = len(multi_intent_texts[j])
         end = offset + num_intents
 
-        # 构造 multi-token 场景，提取每个意图在检索空间中的输出
-        img_feat = ref_features[idx:idx + 1]  # [1, D]
-        text_list = [single_text_features[offset + i:offset + i + 1] for i in range(num_intents)]
-        multi_intent_features = _compute_intent_features_from_multi_token(
-            fusion_module, img_feat, text_list
-        )  # [1, k, D]
-        multi_intent_features = multi_intent_features.squeeze(0)  # [k, D]
-
-        # 计算 retrieval-space edit directions 两两之间的 cosine similarity
-        image_only_feature = fusion_module.compose_image(img_feat).squeeze(0)
-        intent_deltas = multi_intent_features - image_only_feature.unsqueeze(0)
-        deltas_norm = F.normalize(intent_deltas, dim=-1)  # [k, D]
-        gram = torch.mm(deltas_norm, deltas_norm.t())  # [k, k]
-
-        # 取上三角（i < j）的 cos^2 作为软正交惩罚
-        mask = torch.triu(torch.ones_like(gram), diagonal=1).bool()
-        cos_sims = gram[mask]
-        if cos_sims.numel() > 0:
-            losses.append((cos_sims ** 2).mean())
+        # Compute soft orthogonality directly from each single-intent fused query feature.
+        single_queries = single_query_features[offset:end]  # [k, D]
+        losses.append(_compute_soft_orthogonality_loss(single_queries))
 
         offset = end
 

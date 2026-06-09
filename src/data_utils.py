@@ -290,7 +290,7 @@ class FashionIQDataset(Dataset):
     
     def get_images_batch(self, image_names: List[str], num_workers: int = 4) -> torch.Tensor:
         """
-        高效批量获取图像。
+        Efficiently batch-load images.
         
         Args:
             image_names: List of image names
@@ -437,7 +437,7 @@ class CIRRDataset(Dataset):
     
     def get_images_batch(self, image_names: List[str], num_workers: int = 4) -> torch.Tensor:
         """
-        高效批量获取图像。
+        Efficiently batch-load images.
         
         Args:
             image_names: List of image names
