@@ -595,11 +595,18 @@ def compute_clip_ance_listwise_loss(
     scale = get_similarity_scale(logit_scale=logit_scale)
     logits = torch.cat([group_sim.float() for _, group_sim in ordered_groups], dim=1) * scale
 
+    # raw_group_scores = {
+    #     "target": 4.0,
+    #     "hard": 3.0 + float(np.log(max(float(hard_negative_weight), 1e-8))),
+    #     "partial_intent": 2.0 + float(np.log(max(float(partial_intent_negative_weight), 1e-8))),
+    #     "ref_hard": 1.0 + float(np.log(max(float(ref_hard_negative_weight), 1e-8))),
+    #     "in_batch": 0.0,
+    # }
     raw_group_scores = {
         "target": 4.0,
-        "hard": 3.0 + float(np.log(max(float(hard_negative_weight), 1e-8))),
-        "partial_intent": 2.0 + float(np.log(max(float(partial_intent_negative_weight), 1e-8))),
-        "ref_hard": 1.0 + float(np.log(max(float(ref_hard_negative_weight), 1e-8))),
+        "hard": 3.0,
+        "partial_intent": 2.0,
+        "ref_hard": 1.0,
         "in_batch": 0.0,
     }
 

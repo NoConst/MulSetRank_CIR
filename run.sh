@@ -21,7 +21,7 @@ nohup deepspeed --include localhost:0,1,2,3,4 src/deepspeed_clip_ance_train.py \
     --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
     --deepspeed-config ds_config_zero2.json > deepspeed_clip_ance_fiq_H_14_partial_intent_all_listwise_loss_sum.log &
 
-nohup deepspeed --include localhost:1,2,3,4 --master_port 29641 src/deepspeed_clip_ance_train.py \
+nohup deepspeed --include localhost:1,2,3 --master_port 29641 src/deepspeed_clip_ance_train.py \
     --dataset fashionIQ \
     --clip-model-name "ViT-H/14" \
     --batch-size 8 \
@@ -46,9 +46,9 @@ nohup deepspeed --include localhost:1,2,3,4 --master_port 29641 src/deepspeed_cl
     --save-best \
     --partial-intent-queries-path outputs/fiq_partial_intent_queries/partial_intent_queries.json \
     --single-intent-queries-path outputs/fiq_single_intent_queries/single_intent_queries.json \
-    --intent-consistency-weight 0.5 \
-    --intent-orthogonality-weight 0.3 \
-    --intent-global-consistency-weight 0.5 \
+    --intent-consistency-weight 0.3 \
+    --intent-orthogonality-weight 0.1 \
+    --intent-global-consistency-weight 0.3 \
     --intent-global-consistency-temperature 0.2 \
     --intent-consistency-epsilon 0.05 \
     --experiment-name contrastive_listwise_crossattn_ic_orth_all_loss_gpu1234 \
