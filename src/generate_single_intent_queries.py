@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate single-intent query variants for FashionIQ train/val text queries.
+Generate single-intent query variants for composed image retrieval text queries.
 
-For each composed FashionIQ query:
+For each composed query:
   - If the query has multiple intents, split it into multiple single-intent
     queries. Each split query must be a contiguous substring copied from the
     original query.
@@ -10,8 +10,7 @@ For each composed FashionIQ query:
 
 The script uses DeepSeek's OpenAI-compatible chat API. It writes a detailed
 JSONL progress file for resume, a main JSON mapping query text to a list of
-single-intent queries, and a compatibility JSON that maps query text to the
-first generated query for existing partial-intent training code.
+single-intent queries, and detail/sample/summary files for auditing.
 
 Example:
     python src/generate_single_intent_queries.py \
@@ -20,6 +19,12 @@ Example:
         --dress-types dress shirt toptee \
         --max-workers 8 \
         --output-dir outputs/fiq_single_intent_queries
+
+    python src/generate_single_intent_queries.py \
+        --dataset cirr \
+        --splits train \
+        --max-workers 8 \
+        --output-dir outputs/cirr_single_intent_queries
 """
 
 from __future__ import annotations
@@ -46,16 +51,16 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 
 
 SYSTEM_PROMPT = """\
-You are an expert annotator for composed image retrieval fashion queries.
+You are an expert annotator for composed image retrieval queries.
 
 Task:
-Given one FashionIQ text query, decide whether it contains one modification
-intent or multiple modification intents.
+Given one text query, decide whether it contains one modification intent or
+multiple modification intents.
 
 Definitions:
 - A modification intent is one separately actionable desired change, such as
-  color, pattern, material, sleeve length, neckline, fit, length, style,
-  coverage, logo/graphic, or adding/removing a visible attribute.
+  color, pattern, material, shape, size, count, layout, object category, style,
+  visible attribute, or adding/removing/replacing an object or scene property.
 - Do not double-count repeated or synonymous wording.
 
 Output rules:
@@ -83,6 +88,12 @@ Output: {"intent_type":"multi_intent","single_intent_queries":["Is short sleeved
 Input: Is a lighter color
 Output: {"intent_type":"single_intent","single_intent_queries":["is lighter"]}
 
+Input: Table and chairs turn to more dark color and has a gray carpet
+Output: {"intent_type":"multi_intent","single_intent_queries":["turn to more dark color","has a gray carpet"]}
+
+Input: has six white chairs
+Output: {"intent_type":"single_intent","single_intent_queries":["has chairs"]}
+
 JSON schema:
 {
   "intent_type": "multi_intent" or "single_intent",
@@ -94,6 +105,7 @@ JSON schema:
 def resolve_dataset_path() -> Path:
     candidates = [
         os.environ.get("MULSETRANK_DATASETS_DIR"),
+        Path(__file__).absolute().parents[2] / "datasets",
         "/workspace/CAM-CIR_backup/datasets",
         "/root/siton-data-92a7d2fc7b594215b07e48fd8818598b/CAM-CIR_backup/datasets",
     ]
@@ -108,6 +120,7 @@ def resolve_dataset_path() -> Path:
 
 DATASET_PATH = resolve_dataset_path()
 FIQ_PATH = DATASET_PATH / "fashionIQ_dataset"
+CIRR_PATH = DATASET_PATH / "cirr_dataset" / "CIRR" / "cirr"
 
 
 def utc_now() -> str:
@@ -165,6 +178,71 @@ def load_fiq_samples(
     return samples
 
 
+def load_cirr_samples(
+    splits: list[str],
+    limit_per_group: int | None,
+    limit_total: int | None,
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for split in splits:
+        if split not in {"train", "val", "test1"}:
+            raise ValueError(f"CIRR split must be train, val, or test1, got: {split}")
+
+        cap_file = CIRR_PATH / "captions" / f"cap.rc2.{split}.json"
+        with open(cap_file) as f:
+            triplets = json.load(f)
+
+        group_count = 0
+        for idx, triplet in enumerate(triplets):
+            if limit_per_group is not None and group_count >= limit_per_group:
+                break
+
+            text_query = " ".join(str(triplet["caption"]).strip().split())
+            if not text_query:
+                continue
+            samples.append(
+                {
+                    "sample_id": f"cirr_{split}_{idx}",
+                    "dataset": "cirr",
+                    "split": split,
+                    "index": idx,
+                    "pairid": triplet.get("pairid"),
+                    "reference": triplet.get("reference"),
+                    "target_hard": triplet.get("target_hard"),
+                    "caption": triplet.get("caption"),
+                    "img_set_id": (triplet.get("img_set") or {}).get("id"),
+                    "text_query": text_query,
+                }
+            )
+            group_count += 1
+            if limit_total is not None and len(samples) >= limit_total:
+                return samples
+    return samples
+
+
+def load_samples(
+    dataset: str,
+    splits: list[str],
+    dress_types: list[str],
+    limit_per_group: int | None,
+    limit_total: int | None,
+) -> list[dict[str, Any]]:
+    if dataset == "fashioniq":
+        return load_fiq_samples(
+            splits=splits,
+            dress_types=dress_types,
+            limit_per_group=limit_per_group,
+            limit_total=limit_total,
+        )
+    if dataset == "cirr":
+        return load_cirr_samples(
+            splits=splits,
+            limit_per_group=limit_per_group,
+            limit_total=limit_total,
+        )
+    raise ValueError(f"Unsupported dataset: {dataset}")
+
+
 def make_query_id(text_query: str) -> str:
     digest = hashlib.sha1(text_query.encode("utf-8")).hexdigest()
     return f"q_{digest[:16]}"
@@ -178,7 +256,7 @@ def build_query_tasks(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
             text_query,
             {
                 "query_id": make_query_id(text_query),
-                "dataset": "fashioniq",
+                "dataset": sample["dataset"],
                 "text_query": text_query,
                 "sample_ids": [],
                 "samples": [],
@@ -222,14 +300,20 @@ def normalize_item(text: Any) -> str:
 
 def find_source_substring(source: str, candidate: str) -> str | None:
     candidate = candidate.strip()
-    if candidate in source:
-        return candidate
 
     source_lower = source.lower()
     candidate_lower = candidate.lower()
     pos = source_lower.find(candidate_lower)
     if pos >= 0:
         return source[pos : pos + len(candidate)]
+
+    # Accept differences that only come from repeated or collapsed whitespace in
+    # the raw query captions, while still requiring a contiguous source span.
+    whitespace_pattern = r"\s+".join(re.escape(part) for part in candidate.split())
+    if whitespace_pattern:
+        match = re.search(whitespace_pattern, source, flags=re.IGNORECASE)
+        if match is not None:
+            return source[match.start() : match.end()]
 
     trimmed = candidate.strip(" .,;:")
     if trimmed != candidate:
@@ -297,18 +381,31 @@ def validate_model_result(text_query: str, parsed: dict[str, Any]) -> dict[str, 
 def call_deepseek_one(
     client: OpenAI,
     text_query: str,
+    dataset: str,
     model: str,
     max_tokens: int,
     temperature: float,
     max_retries: int,
 ) -> tuple[dict[str, Any], str]:
-    user_prompt = (
-        "Process this FashionIQ text query according to the rules.\n"
-        f"Input query: {text_query}"
-    )
-
     last_error: Exception | None = None
+    last_raw_output = ""
     for attempt in range(max_retries):
+        if attempt == 0:
+            user_prompt = (
+                f"Process this {dataset} text query according to the rules.\n"
+                f"Input query: {text_query}"
+            )
+        else:
+            user_prompt = (
+                f"Process this {dataset} text query again. The previous answer "
+                "failed validation.\n"
+                f"Input query: {text_query}\n"
+                f"Validation error: {last_error}\n"
+                f"Previous answer: {last_raw_output or '<empty>'}\n\n"
+                "Return one corrected JSON object only. For multi_intent, every "
+                "single_intent_queries item must be a contiguous substring copied "
+                "from the input query. Do not invent helper verbs or rewrite words."
+            )
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -330,8 +427,9 @@ def call_deepseek_one(
             raw_output = response.choices[0].message.content or ""
             if not raw_output.strip():
                 raise RuntimeError("model returned empty JSON content")
+            last_raw_output = raw_output.strip()
             parsed = parse_json_object(raw_output)
-            return validate_model_result(text_query, parsed), raw_output.strip()
+            return validate_model_result(text_query, parsed), last_raw_output
         except Exception as exc:
             last_error = exc
             if attempt == max_retries - 1:
@@ -353,6 +451,7 @@ def process_one(
         normalized, raw_output = call_deepseek_one(
             client=client,
             text_query=task["text_query"],
+            dataset=task["dataset"],
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -403,6 +502,7 @@ def save_outputs(
     output_dir: Path,
     entries: list[dict[str, Any]],
     samples: list[dict[str, Any]],
+    dataset: str,
     model: str,
     base_url: str,
 ) -> dict[str, Any]:
@@ -412,7 +512,6 @@ def save_outputs(
     query_id_by_text = {entry["text_query"]: entry["query_id"] for entry in entries}
 
     query_mapping: dict[str, list[str]] = {}
-    first_query_mapping: dict[str, str] = {}
     for entry in sorted(entries, key=sort_entry):
         if entry.get("status") != "ok":
             continue
@@ -420,13 +519,9 @@ def save_outputs(
         if not queries:
             continue
         query_mapping[entry["text_query"]] = queries
-        first_query_mapping[entry["text_query"]] = queries[0]
 
     with open(output_dir / "single_intent_queries.json", "w") as f:
         json.dump(query_mapping, f, ensure_ascii=False, indent=2)
-
-    with open(output_dir / "partial_intent_queries.json", "w") as f:
-        json.dump(first_query_mapping, f, ensure_ascii=False, indent=2)
 
     detail_file = output_dir / "single_intent_details.jsonl"
     with open(detail_file, "w") as f:
@@ -459,6 +554,7 @@ def save_outputs(
         entries=entries,
         samples=samples,
         query_mapping=query_mapping,
+        dataset=dataset,
         model=model,
         base_url=base_url,
     )
@@ -472,6 +568,7 @@ def build_summary(
     entries: list[dict[str, Any]],
     samples: list[dict[str, Any]],
     query_mapping: dict[str, list[str]],
+    dataset: str,
     model: str,
     base_url: str,
 ) -> dict[str, Any]:
@@ -479,7 +576,7 @@ def build_summary(
         "created_at": utc_now(),
         "model": model,
         "base_url": base_url,
-        "dataset": "fashioniq",
+        "dataset": dataset,
         "total_samples": len(samples),
         "unique_queries": len(entries),
         "ok_queries": 0,
@@ -487,7 +584,7 @@ def build_summary(
         "multi_intent_queries": 0,
         "single_intent_queries": 0,
         "generated_query_keys": len(query_mapping),
-        "by_split_dress_type": {},
+        "by_group": {},
     }
 
     for entry in entries:
@@ -501,8 +598,9 @@ def build_summary(
             summary["error_queries"] += 1
 
     for sample in samples:
-        key = f"{sample['split']}/{sample['dress_type']}"
-        group = summary["by_split_dress_type"].setdefault(
+        group_name = sample.get("dress_type") or "all"
+        key = f"{sample['split']}/{group_name}"
+        group = summary["by_group"].setdefault(
             key,
             {
                 "samples": 0,
@@ -512,7 +610,7 @@ def build_summary(
         group["samples"] += 1
         group["unique_queries"].add(make_query_id(sample["text_query"]))
 
-    for group in summary["by_split_dress_type"].values():
+    for group in summary["by_group"].values():
         group["unique_queries"] = len(group["unique_queries"])
 
     return summary
@@ -521,12 +619,13 @@ def build_summary(
 def print_sample_counts(samples: list[dict[str, Any]]) -> None:
     counts: dict[tuple[str, str], int] = {}
     for sample in samples:
-        key = (sample["split"], sample["dress_type"])
+        key = (sample["split"], sample.get("dress_type") or "all")
         counts[key] = counts.get(key, 0) + 1
 
-    print(f"Loaded {len(samples)} FashionIQ samples")
-    for (split, dress_type), count in sorted(counts.items()):
-        print(f"  fashioniq/{split}/{dress_type}: {count}")
+    dataset = samples[0]["dataset"] if samples else "unknown"
+    print(f"Loaded {len(samples)} {dataset} samples")
+    for (split, group_name), count in sorted(counts.items()):
+        print(f"  {dataset}/{split}/{group_name}: {count}")
 
 
 def print_summary(summary: dict[str, Any]) -> None:
@@ -541,20 +640,20 @@ def print_summary(summary: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate single-intent/weak FIQ text queries with DeepSeek."
+        description="Generate single-intent/weak CIR text queries with DeepSeek."
     )
     parser.add_argument(
         "--dataset",
         default="fashioniq",
-        choices=["fashioniq"],
-        help="Dataset to process. Currently implemented for FashionIQ.",
+        choices=["fashioniq", "cirr"],
+        help="Dataset to process.",
     )
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["train", "val"],
-        choices=["train", "val"],
-        help="FashionIQ splits to process.",
+        default=None,
+        choices=["train", "val", "test1"],
+        help="Splits to process. Defaults to train val for FashionIQ and train for CIRR.",
     )
     parser.add_argument(
         "--dress-types",
@@ -567,7 +666,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    parser.add_argument("--output-dir", default="outputs/fiq_single_intent_queries")
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--max-workers", "--max_workers", dest="max_workers", type=int, default=4)
     parser.add_argument("--max-retries", "--max_retries", dest="max_retries", type=int, default=3)
     parser.add_argument("--max-tokens", "--max_tokens", dest="max_tokens", type=int, default=512)
@@ -592,7 +691,20 @@ def main() -> None:
     parser.add_argument(
         "--retry-errors",
         action="store_true",
-        help="Retry queries whose latest progress entry is an error.",
+        default=True,
+        help="Retry queries whose latest progress entry is an error. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-retry-errors",
+        dest="retry_errors",
+        action="store_false",
+        help="Treat previous error entries as completed and do not retry them.",
+    )
+    parser.add_argument(
+        "--error-retry-passes",
+        type=int,
+        default=2,
+        help="Extra full passes over queries that still fail after per-query retries.",
     )
     args = parser.parse_args()
 
@@ -600,9 +712,25 @@ def main() -> None:
         raise ValueError("--max-workers must be positive")
     if args.max_retries <= 0:
         raise ValueError("--max-retries must be positive")
+    if args.error_retry_passes < 0:
+        raise ValueError("--error-retry-passes must be non-negative")
 
-    samples = load_fiq_samples(
-        splits=args.splits,
+    splits = args.splits
+    if splits is None:
+        splits = ["train", "val"] if args.dataset == "fashioniq" else ["train"]
+
+    output_dir = Path(
+        args.output_dir
+        or (
+            "outputs/fiq_single_intent_queries"
+            if args.dataset == "fashioniq"
+            else "outputs/cirr_single_intent_queries"
+        )
+    )
+
+    samples = load_samples(
+        dataset=args.dataset,
+        splits=splits,
         dress_types=args.dress_types,
         limit_per_group=args.limit_per_group,
         limit_total=args.limit_total,
@@ -619,7 +747,6 @@ def main() -> None:
     if not api_key:
         raise RuntimeError(f"Please set the {args.api_key_env} environment variable")
 
-    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     progress_file = output_dir / "single_intent_progress.jsonl"
 
@@ -637,7 +764,8 @@ def main() -> None:
 
     client = create_openai_client(api_key=api_key, base_url=args.base_url)
 
-    if remaining:
+    retry_pass = 0
+    while remaining:
         write_lock = Lock()
         ok_count = 0
         err_count = 0
@@ -659,7 +787,11 @@ def main() -> None:
                 pbar = tqdm(
                     as_completed(futures),
                     total=len(futures),
-                    desc="Generating single-intent queries",
+                    desc=(
+                        "Generating single-intent queries"
+                        if retry_pass == 0
+                        else f"Retrying failed queries pass {retry_pass}"
+                    ),
                 )
                 for future in pbar:
                     entry = future.result()
@@ -671,7 +803,22 @@ def main() -> None:
                         err_count += 1
                     pbar.set_postfix(ok=ok_count, err=err_count)
 
-        print(f"Processing done: {ok_count} ok, {err_count} errors")
+        print(
+            f"Processing pass {retry_pass} done: "
+            f"{ok_count} ok, {err_count} errors"
+        )
+
+        if not args.retry_errors or err_count == 0 or retry_pass >= args.error_retry_passes:
+            break
+
+        retry_pass += 1
+        latest_progress = read_latest_progress(progress_file)
+        remaining = [
+            task
+            for task in tasks
+            if latest_progress.get(task["query_id"], {}).get("status") != "ok"
+        ]
+        print(f"Retrying remaining error/missing queries: {len(remaining)}")
 
     latest_progress = read_latest_progress(progress_file)
     entries = []
@@ -694,6 +841,7 @@ def main() -> None:
         output_dir=output_dir,
         entries=entries,
         samples=samples,
+        dataset=args.dataset,
         model=args.model,
         base_url=args.base_url,
     )

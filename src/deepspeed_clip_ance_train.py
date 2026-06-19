@@ -8,6 +8,7 @@ CLIP Fine-tuning with ANCE using Hugging Face Transformers
 """
 
 import json
+import random
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,8 @@ from clip_ance_utils import (
     compute_intent_consistency_loss,
     compute_intent_orthogonality_loss,
     enable_model_logit_scale_training,
+    extract_clip_image_features,
+    extract_clip_text_features,
     get_model_logit_scale,
     get_similarity_scale,
     save_model_logit_scale,
@@ -188,6 +191,67 @@ def prepare_hf_model_cache_for_distributed(hf_model_name: str) -> bool:
     barrier({"enabled": True})
     return True
 
+
+def load_single_intent_map(
+    path: Optional[str],
+    log: logging.Logger,
+    required: bool = False,
+) -> Optional[dict]:
+    """Load canonical caption -> list[str] single-intent mapping."""
+    if not path or not os.path.exists(path):
+        if required:
+            raise FileNotFoundError(
+                "single-intent query data is required for the configured losses, "
+                f"but the file was not found: {path}"
+            )
+        return None
+
+    with open(path, "r") as f:
+        raw_map = json.load(f)
+
+    if not isinstance(raw_map, dict):
+        raise ValueError(f"single-intent query file must be a JSON object: {path}")
+
+    normalized_map = {}
+    for caption, value in raw_map.items():
+        if not isinstance(value, list):
+            raise ValueError(
+                "single-intent query file must map each caption to list[str]; "
+                f"got {type(value).__name__} for caption {caption!r}"
+            )
+
+        cleaned_intents = []
+        for intent in value:
+            if not isinstance(intent, str):
+                raise ValueError(
+                    "single-intent query file must map each caption to list[str]; "
+                    f"got non-string intent for caption {caption!r}"
+                )
+            cleaned = " ".join(intent.strip().split())
+            if cleaned:
+                cleaned_intents.append(cleaned)
+        if cleaned_intents:
+            normalized_map[caption] = cleaned_intents
+
+    log.info(f"Loaded {len(normalized_map)} single-intent decompositions from {path}")
+    return normalized_map
+
+
+def sample_partial_intents_from_single_map(
+    input_captions: List[str],
+    single_intent_map: dict,
+) -> List[str]:
+    """Pick one single intent per caption, falling back to the original caption."""
+    partial_intents = []
+    for caption in input_captions:
+        intents = single_intent_map.get(caption)
+        if not isinstance(intents, list) or len(intents) == 0:
+            partial_intents.append(caption)
+            continue
+        partial_intents.append(random.choice(intents) if len(intents) > 1 else intents[0])
+
+    return partial_intents
+
 # =========================================================
 # Original utilities (minimally adjusted to accept device)
 # =========================================================
@@ -277,7 +341,7 @@ def encode_text_hf(clip_model, tokenizer, texts, device):
     ).to(device)
     # Use autocast for mixed precision compatibility
     with torch.cuda.amp.autocast():
-        text_features = clip_model.get_text_features(**inputs)
+        text_features = extract_clip_text_features(clip_model, **inputs)
     return text_features
 
 def extract_clip_index_features(
@@ -300,7 +364,7 @@ def extract_clip_index_features(
         images = images.to(device, non_blocking=True)
         with torch.no_grad():
             with torch.cuda.amp.autocast():
-                raw_image_features = clip_model.get_image_features(pixel_values=images)
+                raw_image_features = extract_clip_image_features(clip_model, pixel_values=images)
                 raw_image_features = F.normalize(raw_image_features, dim=-1)
                 image_features = compose_image_features(clip_model, raw_image_features)
             all_features.append(image_features.cpu())
@@ -678,7 +742,6 @@ def clip_finetune_fiq_ance(
     dist_info: Optional[dict] = None,
     deepspeed_config: str = None,
     grad_accum_steps: int = 1,
-    partial_intent_queries_path: str = None,
     **kwargs
 ):
     assert dist_info is not None
@@ -821,28 +884,18 @@ def clip_finetune_fiq_ance(
             preprocess,
         )
 
-    # Load partial intent queries for partial intent negative mining
-    partial_intent_queries = None
-    if (
-        use_ranked_training
-        and partial_intent_weight > 0.0
-        and partial_intent_queries_path
-        and os.path.exists(partial_intent_queries_path)
-    ):
-        with open(partial_intent_queries_path, "r") as f:
-            partial_intent_queries = json.load(f)
-        logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
-
-    # Load single-intent decomposition for intent losses
-    single_intent_map = None
-    if (
-        (intent_consistency_weight > 0.0 or intent_orthogonality_weight > 0.0)
-        and single_intent_queries_path
-        and os.path.exists(single_intent_queries_path)
-    ):
-        with open(single_intent_queries_path, "r") as f:
-            single_intent_map = json.load(f)
-        logger.info(f"Loaded {len(single_intent_map)} single-intent decompositions from {single_intent_queries_path}")
+    # Load canonical single-intent decomposition once. It is used directly by
+    # intent losses and sampled from for partial-intent hard negative mining.
+    requires_single_intent_map = (
+        (use_ranked_training and partial_intent_weight > 0.0)
+        or intent_consistency_weight > 0.0
+        or intent_orthogonality_weight > 0.0
+    )
+    single_intent_map = load_single_intent_map(
+        single_intent_queries_path,
+        logger,
+        required=requires_single_intent_map,
+    )
 
     # DistributedSampler for training
     if dist_info["enabled"]:
@@ -967,8 +1020,8 @@ def clip_finetune_fiq_ance(
             model_engine.train()
 
             # DeepSpeed handles mixed precision automatically via config
-            ref_features = model_engine.module.get_image_features(pixel_values=reference_images)
-            target_features = model_engine.module.get_image_features(pixel_values=target_images)
+            ref_features = extract_clip_image_features(model_engine.module, pixel_values=reference_images)
+            target_features = extract_clip_image_features(model_engine.module, pixel_values=target_images)
             text_features = encode_text_hf(model_engine.module, tokenizer, input_captions, device)
 
             ref_features = F.normalize(ref_features, dim=-1)
@@ -1010,7 +1063,7 @@ def clip_finetune_fiq_ance(
                     all_neg_names,
                     num_workers=kwargs.get("num_workers", 4),
                 ).to(device, non_blocking=True)
-                all_neg_features = model_engine.module.get_image_features(pixel_values=all_neg_images)
+                all_neg_features = extract_clip_image_features(model_engine.module, pixel_values=all_neg_images)
                 all_neg_features = F.normalize(all_neg_features, dim=-1)
                 all_neg_features = compose_image_features(model_engine.module, all_neg_features)
                 hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
@@ -1025,7 +1078,7 @@ def clip_finetune_fiq_ance(
                         num_workers=kwargs.get("num_workers", 4),
                     )
                     all_ref_images = all_ref_images.to(device, non_blocking=True)
-                    all_ref_features = model_engine.module.get_image_features(pixel_values=all_ref_images)
+                    all_ref_features = extract_clip_image_features(model_engine.module, pixel_values=all_ref_images)
                     all_ref_features = F.normalize(all_ref_features, dim=-1)
                     all_ref_features = compose_image_features(model_engine.module, all_ref_features)
                     ref_hard_negative_features = all_ref_features.view(images_in_batch, num_ref_negatives, -1)
@@ -1034,14 +1087,14 @@ def clip_finetune_fiq_ance(
                 # Mine partial intent negatives
                 partial_intent_negative_features = None
                 if (
-                    partial_intent_queries is not None
+                    single_intent_map is not None
                     and partial_intent_weight > 0.0
                     and hard_neg_indices is not None
                 ):
-                    partial_intents = [
-                        partial_intent_queries.get(cap, cap)
-                        for cap in input_captions
-                    ]
+                    partial_intents = sample_partial_intents_from_single_map(
+                        input_captions=input_captions,
+                        single_intent_map=single_intent_map,
+                    )
                     excluded_neg_indices = hard_neg_indices
                     if ref_hard_neg_indices is not None:
                         excluded_neg_indices = torch.cat([hard_neg_indices, ref_hard_neg_indices], dim=1)
@@ -1061,7 +1114,7 @@ def clip_finetune_fiq_ance(
                         all_pi_names,
                         num_workers=kwargs.get("num_workers", 4),
                     ).to(device, non_blocking=True)
-                    all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
+                    all_pi_features = extract_clip_image_features(model_engine.module, pixel_values=all_pi_images)
                     all_pi_features = F.normalize(all_pi_features, dim=-1)
                     all_pi_features = compose_image_features(model_engine.module, all_pi_features)
                     partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
@@ -1225,7 +1278,6 @@ def clip_finetune_single_text_ance(
     dist_info: Optional[dict] = None,
     deepspeed_config: str = None,
     grad_accum_steps: int = 1,
-    partial_intent_queries_path: str = None,
     **kwargs
 ):
     assert dist_info is not None
@@ -1355,28 +1407,18 @@ def clip_finetune_single_text_ance(
     if not use_ranked_training:
         classic_train_dataset = None
 
-    # Load partial intent queries for partial intent negative mining
-    partial_intent_queries = None
-    if (
-        use_ranked_training
-        and partial_intent_weight > 0.0
-        and partial_intent_queries_path
-        and os.path.exists(partial_intent_queries_path)
-    ):
-        with open(partial_intent_queries_path, "r") as f:
-            partial_intent_queries = json.load(f)
-        logger.info(f"Loaded {len(partial_intent_queries)} partial intent queries from {partial_intent_queries_path}")
-
-    # Load single-intent decomposition for intent losses
-    single_intent_map = None
-    if (
-        (intent_consistency_weight > 0.0 or intent_orthogonality_weight > 0.0)
-        and single_intent_queries_path
-        and os.path.exists(single_intent_queries_path)
-    ):
-        with open(single_intent_queries_path, "r") as f:
-            single_intent_map = json.load(f)
-        logger.info(f"Loaded {len(single_intent_map)} single-intent decompositions from {single_intent_queries_path}")
+    # Load canonical single-intent decomposition once. It is used directly by
+    # intent losses and sampled from for partial-intent hard negative mining.
+    requires_single_intent_map = (
+        (use_ranked_training and partial_intent_weight > 0.0)
+        or intent_consistency_weight > 0.0
+        or intent_orthogonality_weight > 0.0
+    )
+    single_intent_map = load_single_intent_map(
+        single_intent_queries_path,
+        logger,
+        required=requires_single_intent_map,
+    )
 
     if dist_info["enabled"]:
         train_sampler = DistributedSampler(relative_train_dataset, shuffle=True, drop_last=True)
@@ -1486,8 +1528,8 @@ def clip_finetune_single_text_ance(
 
             model_engine.train()
             
-            ref_features = model_engine.module.get_image_features(pixel_values=reference_images)
-            target_features = model_engine.module.get_image_features(pixel_values=target_images)
+            ref_features = extract_clip_image_features(model_engine.module, pixel_values=reference_images)
+            target_features = extract_clip_image_features(model_engine.module, pixel_values=target_images)
             text_features = encode_text_hf(model_engine.module, tokenizer, input_captions, device)
 
             ref_features = F.normalize(ref_features, dim=-1)
@@ -1530,7 +1572,7 @@ def clip_finetune_single_text_ance(
                     all_neg_names,
                     num_workers=kwargs.get("num_workers", 4),
                 ).to(device, non_blocking=True)
-                all_neg_features = model_engine.module.get_image_features(pixel_values=all_neg_images)
+                all_neg_features = extract_clip_image_features(model_engine.module, pixel_values=all_neg_images)
                 all_neg_features = F.normalize(all_neg_features, dim=-1)
                 all_neg_features = compose_image_features(model_engine.module, all_neg_features)
                 hard_negative_features = all_neg_features.view(images_in_batch, num_negatives, -1)
@@ -1544,7 +1586,7 @@ def clip_finetune_single_text_ance(
                         all_ref_names,
                         num_workers=kwargs.get("num_workers", 4),
                     ).to(device, non_blocking=True)
-                    all_ref_features = model_engine.module.get_image_features(pixel_values=all_ref_images)
+                    all_ref_features = extract_clip_image_features(model_engine.module, pixel_values=all_ref_images)
                     all_ref_features = F.normalize(all_ref_features, dim=-1)
                     all_ref_features = compose_image_features(model_engine.module, all_ref_features)
                     ref_hard_negative_features = all_ref_features.view(images_in_batch, num_ref_negatives, -1)
@@ -1553,14 +1595,14 @@ def clip_finetune_single_text_ance(
                 # Mine partial intent negatives
                 partial_intent_negative_features = None
                 if (
-                    partial_intent_queries is not None
+                    single_intent_map is not None
                     and partial_intent_weight > 0.0
                     and hard_neg_indices is not None
                 ):
-                    partial_intents = [
-                        partial_intent_queries.get(cap, cap)
-                        for cap in input_captions
-                    ]
+                    partial_intents = sample_partial_intents_from_single_map(
+                        input_captions=input_captions,
+                        single_intent_map=single_intent_map,
+                    )
                     excluded_neg_indices = hard_neg_indices
                     if ref_hard_neg_indices is not None:
                         excluded_neg_indices = torch.cat([hard_neg_indices, ref_hard_neg_indices], dim=1)
@@ -1580,7 +1622,7 @@ def clip_finetune_single_text_ance(
                         all_pi_names,
                         num_workers=kwargs.get("num_workers", 4),
                     ).to(device, non_blocking=True)
-                    all_pi_features = model_engine.module.get_image_features(pixel_values=all_pi_images)
+                    all_pi_features = extract_clip_image_features(model_engine.module, pixel_values=all_pi_images)
                     all_pi_features = F.normalize(all_pi_features, dim=-1)
                     all_pi_features = compose_image_features(model_engine.module, all_pi_features)
                     partial_intent_negative_features = all_pi_features.view(images_in_batch, num_pi_neg, -1)
@@ -1737,6 +1779,7 @@ def clip_finetune_single_text_ance(
     barrier(dist_info)
 
 def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -1772,8 +1815,6 @@ if __name__ == "__main__":
     parser.add_argument("--partial-intent-num-negatives", default=None, type=int)
     parser.add_argument("--partial-intent-weight", default=0.75, type=float)
     parser.add_argument("--listwise-weight", default=0.2, type=float)
-    parser.add_argument("--partial-intent-queries-path", type=str, default=None,
-                        help="Path to partial intent queries JSON file")
     parser.add_argument("--single-intent-queries-path", type=str, default=None,
                         help="Path to single intent decomposition JSON file (e.g., fiq_single_intent_queries.json)")
     parser.add_argument("--intent-consistency-weight", type=float, default=0.0,
@@ -1855,7 +1896,6 @@ if __name__ == "__main__":
         "partial_intent_num_negatives": args.partial_intent_num_negatives if args.partial_intent_num_negatives else args.ance_num_negatives,
         "partial_intent_weight": args.partial_intent_weight,
         "listwise_weight": args.listwise_weight,
-        "partial_intent_queries_path": args.partial_intent_queries_path,
         "single_intent_queries_path": args.single_intent_queries_path,
         "intent_consistency_weight": args.intent_consistency_weight,
         "intent_orthogonality_weight": args.intent_orthogonality_weight,

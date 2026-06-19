@@ -103,6 +103,87 @@ def set_model_logit_scale(
     return logit_scale
 
 
+def _iter_wrapped_models(model):
+    """Yield a model and common wrapper children without assuming a wrapper type."""
+    seen = set()
+    stack = [model]
+
+    while stack:
+        candidate = stack.pop(0)
+        if candidate is None or id(candidate) in seen:
+            continue
+
+        seen.add(id(candidate))
+        yield candidate
+
+        for attr in ("module", "base_model", "model"):
+            child = getattr(candidate, attr, None)
+            if child is not None and child is not candidate:
+                stack.append(child)
+
+
+def _get_clip_feature_method(model, method_name: str):
+    for candidate in _iter_wrapped_models(model):
+        method = getattr(candidate, method_name, None)
+        if callable(method):
+            return method
+
+    raise AttributeError(
+        f"Unsupported CLIP model wrapper: expected `{method_name}` on the model or one of its children."
+    )
+
+
+def _coerce_clip_feature_output(output, feature_name: str) -> torch.Tensor:
+    """Normalize CLIP feature outputs across Transformers versions."""
+    if isinstance(output, torch.Tensor):
+        features = output
+    else:
+        features = None
+        for attr in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
+            value = getattr(output, attr, None)
+            if isinstance(value, torch.Tensor):
+                features = value
+                break
+
+        if features is None and isinstance(output, (tuple, list)):
+            for value in output:
+                if isinstance(value, torch.Tensor):
+                    features = value
+                    break
+
+        if features is None:
+            raise TypeError(
+                f"{feature_name} must be a tensor or a CLIP output containing tensor features, "
+                f"got {type(output)!r}"
+            )
+
+    if features.dim() == 3:
+        features = features.mean(dim=1)
+
+    if features.dim() != 2:
+        raise ValueError(f"{feature_name} must have shape [B, D], got {tuple(features.shape)}")
+
+    return features
+
+
+def extract_clip_image_features(clip_model, pixel_values: torch.Tensor) -> torch.Tensor:
+    """Return projected CLIP image embeddings as a tensor."""
+    get_image_features = _get_clip_feature_method(clip_model, "get_image_features")
+    return _coerce_clip_feature_output(
+        get_image_features(pixel_values=pixel_values),
+        "image_features",
+    )
+
+
+def extract_clip_text_features(clip_model, **tokenized_inputs) -> torch.Tensor:
+    """Return projected CLIP text embeddings as a tensor."""
+    get_text_features = _get_clip_feature_method(clip_model, "get_text_features")
+    return _coerce_clip_feature_output(
+        get_text_features(**tokenized_inputs),
+        "text_features",
+    )
+
+
 def save_model_logit_scale(
     model,
     save_dir: Union[str, Path],
@@ -180,17 +261,7 @@ class CLIPHardNegativeMiner:
         for names, images in tqdm(dataloader, desc="Extracting features"):
             images = images.to(device, non_blocking=True)
             with torch.cuda.amp.autocast():
-                if not hasattr(clip_model, "get_image_features"):
-                    raise AttributeError(
-                        "Unsupported model for CLIPHardNegativeMiner.build_index: "
-                        "expected Hugging Face CLIP with `get_image_features`."
-                    )
-                image_features = clip_model.get_image_features(pixel_values=images)
-
-                # If token-level features are returned, pool to a single vector
-                if image_features.dim() == 3:
-                    image_features = image_features.mean(dim=1)
-
+                image_features = extract_clip_image_features(clip_model, pixel_values=images)
                 image_features = F.normalize(image_features, dim=-1)
                 image_features = compose_image_features(clip_model, image_features)
             if self.use_gpu:
@@ -408,7 +479,7 @@ class CLIPHardNegativeMiner:
             return_tensors="pt"
         ).to(model_device)
         with torch.cuda.amp.autocast():
-            partial_text_features = clip_model.get_text_features(**inputs)
+            partial_text_features = extract_clip_text_features(clip_model, **inputs)
             partial_text_features = F.normalize(partial_text_features, dim=-1)
 
         partial_query = compose_query_features(clip_model, ref_features, partial_text_features)
@@ -802,7 +873,7 @@ def compute_intent_consistency_loss(
     ).to(device)
 
     with torch.cuda.amp.autocast():
-        single_text_features = model.get_text_features(**inputs)
+        single_text_features = extract_clip_text_features(model, **inputs)
         single_text_features = F.normalize(single_text_features, dim=-1)
 
         # Reuse the corresponding reference image feature for each single intent.
@@ -953,7 +1024,7 @@ def compute_intent_orthogonality_loss(
     ).to(device)
 
     with torch.cuda.amp.autocast():
-        single_text_features = model.get_text_features(**inputs)
+        single_text_features = extract_clip_text_features(model, **inputs)
         single_text_features = F.normalize(single_text_features, dim=-1)
 
         repeat_indices: List[int] = []

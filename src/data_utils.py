@@ -19,6 +19,7 @@ base_path = Path(__file__).absolute().parents[1].absolute()
 def _resolve_dataset_path() -> Path:
     candidates = [
         os.environ.get("MULSETRANK_DATASETS_DIR"),
+        base_path.parent / "datasets",
         "/workspace/CAM-CIR_backup/datasets",
         "/root/siton-data-92a7d2fc7b594215b07e48fd8818598b/CAM-CIR_backup/datasets",
     ]
