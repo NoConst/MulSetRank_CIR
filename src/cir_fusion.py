@@ -122,6 +122,9 @@ class CrossAttentionFusion(nn.Module):
     For standalone gallery images, `compose_image()` is equivalent to
     fusion("", image): it uses a learned blank-text token and keeps the output in
     the same retrieval space as composed queries.
+
+    When requested, the same composer can also expose retrieval-space fused
+    states for CLIP text tokens, which are used by Intent Consistency Learning.
     """
 
     fusion_type = "cross_attention"
@@ -228,10 +231,138 @@ class CrossAttentionFusion(nn.Module):
 
         return image_features, text_features, has_text
 
+    def _compose_token_features(
+        self,
+        image_features: torch.Tensor,
+        text_token_features: Optional[torch.Tensor],
+        text_attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if text_token_features is None:
+            text_token_features = self.blank_text.view(1, 1, -1).expand(
+                image_features.shape[0], 1, -1
+            )
+            text_attention_mask = torch.ones(
+                image_features.shape[0],
+                1,
+                device=image_features.device,
+                dtype=torch.long,
+            )
+
+        if text_token_features.dim() == 2:
+            text_token_features = text_token_features.unsqueeze(1)
+        if text_token_features.dim() != 3:
+            raise ValueError(
+                "text_token_features must have shape [B, L, D], "
+                f"got {tuple(text_token_features.shape)}"
+            )
+        if text_token_features.shape[0] != image_features.shape[0]:
+            raise ValueError(
+                "text_token_features batch size must match image_features, "
+                f"got {text_token_features.shape[0]} and {image_features.shape[0]}"
+            )
+        if text_token_features.shape[-1] != self.embedding_dim:
+            raise ValueError(
+                "text_token_features last dimension must match embedding_dim, "
+                f"got {text_token_features.shape[-1]} and {self.embedding_dim}"
+            )
+
+        text_token_features = F.normalize(
+            text_token_features.to(device=image_features.device, dtype=image_features.dtype),
+            dim=-1,
+        )
+        batch_size, seq_len, _ = text_token_features.shape
+
+        if text_attention_mask is None:
+            text_attention_mask = torch.ones(
+                batch_size,
+                seq_len,
+                device=image_features.device,
+                dtype=torch.bool,
+            )
+        else:
+            text_attention_mask = text_attention_mask.to(device=image_features.device)
+            if text_attention_mask.dim() != 2 or text_attention_mask.shape != (batch_size, seq_len):
+                raise ValueError(
+                    "text_attention_mask must have shape [B, L], "
+                    f"got {tuple(text_attention_mask.shape)} for token features "
+                    f"{tuple(text_token_features.shape)}"
+                )
+            text_attention_mask = text_attention_mask.bool()
+
+        image_token = self.image_proj(image_features).unsqueeze(1)
+        image_token = image_token + self.modality_embeddings[0].view(1, 1, -1)
+
+        flat_text_tokens = text_token_features.reshape(batch_size * seq_len, self.embedding_dim)
+        repeated_image_features = image_features.unsqueeze(1).expand(-1, seq_len, -1)
+        product_token_features = repeated_image_features * text_token_features
+        delta_token_features = repeated_image_features - text_token_features
+
+        text_tokens = self.text_proj(flat_text_tokens).view(batch_size, seq_len, -1)
+        product_tokens = self.product_proj(
+            product_token_features.reshape(batch_size * seq_len, self.embedding_dim)
+        ).view(batch_size, seq_len, -1)
+        delta_tokens = self.delta_proj(
+            delta_token_features.reshape(batch_size * seq_len, self.embedding_dim)
+        ).view(batch_size, seq_len, -1)
+
+        text_tokens = text_tokens + self.modality_embeddings[1].view(1, 1, -1)
+        product_tokens = product_tokens + self.modality_embeddings[2].view(1, 1, -1)
+        delta_tokens = delta_tokens + self.modality_embeddings[3].view(1, 1, -1)
+
+        tokens = torch.cat([image_token, text_tokens, product_tokens, delta_tokens], dim=1)
+        tokens = self.token_norm(tokens)
+
+        text_padding_mask = ~text_attention_mask
+        key_padding_mask = torch.cat(
+            [
+                torch.zeros(batch_size, 1, device=image_features.device, dtype=torch.bool),
+                text_padding_mask,
+                text_padding_mask,
+                text_padding_mask,
+            ],
+            dim=1,
+        )
+
+        token_query = self.query_token.expand(batch_size, seq_len, -1)
+        token_query = token_query + self.image_proj(image_features).unsqueeze(1)
+        token_query = token_query + self.text_proj(flat_text_tokens).view(batch_size, seq_len, -1)
+
+        token_context, _ = self.cross_attn(
+            token_query,
+            tokens,
+            tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        token_context = self.context_norm(token_context)
+
+        residual_input = torch.cat(
+            [
+                repeated_image_features,
+                text_token_features,
+                product_token_features,
+                token_context,
+            ],
+            dim=-1,
+        )
+        flat_residual_input = residual_input.reshape(batch_size * seq_len, self.embedding_dim * 4)
+        residual = self.residual_mlp(flat_residual_input).view(batch_size, seq_len, -1)
+        gate = torch.sigmoid(self.gate_mlp(flat_residual_input)).view(batch_size, seq_len, -1)
+
+        base = (
+            self.image_residual_weight * repeated_image_features
+            + self.text_residual_weight * text_token_features
+        )
+        fused_tokens = base + self.update_scale * gate * residual
+        return F.normalize(fused_tokens, dim=-1)
+
     def forward(
         self,
         image_features: torch.Tensor,
         text_features: Optional[torch.Tensor] = None,
+        text_token_features: Optional[torch.Tensor] = None,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        return_token_features: bool = False,
     ) -> torch.Tensor:
         image_features, text_features, has_text = self._prepare_inputs(image_features, text_features)
 
@@ -265,7 +396,17 @@ class CrossAttentionFusion(nn.Module):
             base = base + self.text_residual_weight * text_features
 
         fused = base + self.update_scale * gate * residual
-        return F.normalize(fused, dim=-1)
+        fused = F.normalize(fused, dim=-1)
+
+        if not return_token_features:
+            return fused
+
+        token_features = self._compose_token_features(
+            image_features=image_features,
+            text_token_features=text_token_features,
+            text_attention_mask=text_attention_mask,
+        )
+        return fused, token_features
 
     def compose_image(self, image_features: torch.Tensor) -> torch.Tensor:
         return self.forward(image_features=image_features, text_features=None)
@@ -348,11 +489,23 @@ def compose_query_features(
     model,
     image_features: torch.Tensor,
     text_features: torch.Tensor,
+    text_token_features: Optional[torch.Tensor] = None,
+    text_attention_mask: Optional[torch.Tensor] = None,
+    return_token_features: bool = False,
 ) -> torch.Tensor:
     fusion_module = get_model_cir_fusion(model)
     if fusion_module is None:
-        return F.normalize(image_features + text_features, dim=-1)
-    return fusion_module(image_features, text_features)
+        query_features = F.normalize(image_features + text_features, dim=-1)
+        if return_token_features:
+            return query_features, None
+        return query_features
+    return fusion_module(
+        image_features,
+        text_features,
+        text_token_features=text_token_features,
+        text_attention_mask=text_attention_mask,
+        return_token_features=return_token_features,
+    )
 
 
 def compose_image_features(

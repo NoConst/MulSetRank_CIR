@@ -184,6 +184,342 @@ def extract_clip_text_features(clip_model, **tokenized_inputs) -> torch.Tensor:
     )
 
 
+def _get_clip_text_components(clip_model):
+    for candidate in _iter_wrapped_models(clip_model):
+        text_model = getattr(candidate, "text_model", None)
+        text_projection = getattr(candidate, "text_projection", None)
+        if text_model is not None and text_projection is not None:
+            return text_model, text_projection
+
+    raise AttributeError(
+        "Unsupported CLIP model wrapper: expected `text_model` and `text_projection` "
+        "on the model or one of its children."
+    )
+
+
+def extract_clip_text_token_features(clip_model, **tokenized_inputs) -> torch.Tensor:
+    """Return projected CLIP text token embeddings as [B, L, D]."""
+    text_model, text_projection = _get_clip_text_components(clip_model)
+    tokenized_inputs = {
+        key: value for key, value in tokenized_inputs.items() if key != "offset_mapping"
+    }
+
+    try:
+        text_outputs = text_model(**tokenized_inputs, return_dict=True)
+    except TypeError:
+        text_outputs = text_model(**tokenized_inputs)
+
+    last_hidden_state = getattr(text_outputs, "last_hidden_state", None)
+    if last_hidden_state is None:
+        if isinstance(text_outputs, (tuple, list)) and len(text_outputs) > 0:
+            last_hidden_state = text_outputs[0]
+        else:
+            raise TypeError("CLIP text model output does not contain token hidden states.")
+
+    token_features = text_projection(last_hidden_state)
+    if token_features.dim() != 3:
+        raise ValueError(
+            "text_token_features must have shape [B, L, D], "
+            f"got {tuple(token_features.shape)}"
+        )
+    return token_features
+
+
+def _move_tokenized_inputs_to_device(tokenized_inputs, device: torch.device):
+    if hasattr(tokenized_inputs, "to"):
+        return tokenized_inputs.to(device)
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in tokenized_inputs.items()
+    }
+
+
+def _tokenize_texts_for_intent_learning(
+    tokenizer,
+    texts: List[str],
+    device: torch.device,
+    return_offsets: bool = False,
+):
+    tokenize_kwargs = {
+        "padding": True,
+        "truncation": True,
+        "max_length": 77,
+        "return_tensors": "pt",
+    }
+
+    offset_mappings = None
+    if return_offsets:
+        try:
+            tokenized_inputs = tokenizer(
+                texts,
+                return_offsets_mapping=True,
+                **tokenize_kwargs,
+            )
+            offset_mappings = tokenized_inputs.pop("offset_mapping", None)
+        except (TypeError, NotImplementedError, ValueError):
+            tokenized_inputs = tokenizer(texts, **tokenize_kwargs)
+    else:
+        tokenized_inputs = tokenizer(texts, **tokenize_kwargs)
+
+    if isinstance(offset_mappings, torch.Tensor):
+        offset_mappings = offset_mappings.cpu()
+
+    return _move_tokenized_inputs_to_device(tokenized_inputs, device), offset_mappings
+
+
+def _normalize_with_char_map(text: str) -> Tuple[str, List[int]]:
+    normalized_chars: List[str] = []
+    char_map: List[int] = []
+    previous_was_space = False
+
+    for char_index, char in enumerate(text):
+        if char.isspace():
+            if not previous_was_space:
+                normalized_chars.append(" ")
+                char_map.append(char_index)
+                previous_was_space = True
+            continue
+
+        normalized_chars.append(char.lower())
+        char_map.append(char_index)
+        previous_was_space = False
+
+    start = 0
+    while start < len(normalized_chars) and normalized_chars[start] == " ":
+        start += 1
+    end = len(normalized_chars)
+    while end > start and normalized_chars[end - 1] == " ":
+        end -= 1
+
+    return "".join(normalized_chars[start:end]), char_map[start:end]
+
+
+def _find_all_substrings(text: str, pattern: str) -> List[int]:
+    if not pattern:
+        return []
+
+    matches = []
+    start = 0
+    while True:
+        pos = text.find(pattern, start)
+        if pos < 0:
+            break
+        matches.append(pos)
+        start = pos + 1
+    return matches
+
+
+def _find_unique_normalized_char_span(full_text: str, intent_text: str) -> Optional[Tuple[int, int]]:
+    strip_chars = " \t\r\n.?,;:!\"'`"
+    candidates = []
+    for candidate in (intent_text.strip(), intent_text.strip(strip_chars)):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        raw_matches = _find_all_substrings(full_text, candidate)
+        if len(raw_matches) == 1:
+            pos = raw_matches[0]
+            return pos, pos + len(candidate)
+        if len(raw_matches) > 1:
+            return None
+
+        lower_matches = _find_all_substrings(full_text.lower(), candidate.lower())
+        if len(lower_matches) == 1:
+            pos = lower_matches[0]
+            return pos, pos + len(candidate)
+        if len(lower_matches) > 1:
+            return None
+
+        full_norm, full_map = _normalize_with_char_map(full_text)
+        intent_norm, _ = _normalize_with_char_map(candidate)
+        norm_matches = _find_all_substrings(full_norm, intent_norm)
+        if len(norm_matches) == 1:
+            norm_start = norm_matches[0]
+            norm_end = norm_start + len(intent_norm) - 1
+            return full_map[norm_start], full_map[norm_end] + 1
+        if len(norm_matches) > 1:
+            return None
+
+    return None
+
+
+def _as_1d_int_list(value) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    if isinstance(value, (tuple, list)) and value and isinstance(value[0], (tuple, list)):
+        value = value[0]
+    return [int(item) for item in value]
+
+
+def _get_special_token_ids(tokenizer) -> set:
+    special_ids = set()
+    for token_id in getattr(tokenizer, "all_special_ids", []) or []:
+        if token_id is not None:
+            special_ids.add(int(token_id))
+    for attr in ("bos_token_id", "eos_token_id", "pad_token_id", "cls_token_id", "sep_token_id"):
+        token_id = getattr(tokenizer, attr, None)
+        if token_id is not None:
+            special_ids.add(int(token_id))
+    return special_ids
+
+
+def _strip_special_token_ids(
+    input_ids,
+    attention_mask,
+    special_token_ids: set,
+) -> Tuple[List[int], List[int]]:
+    ids = _as_1d_int_list(input_ids)
+    mask = _as_1d_int_list(attention_mask)
+    if not mask:
+        mask = [1] * len(ids)
+
+    kept_ids: List[int] = []
+    kept_positions: List[int] = []
+    for pos, token_id in enumerate(ids):
+        if pos >= len(mask) or mask[pos] == 0:
+            continue
+        if token_id in special_token_ids:
+            continue
+        kept_ids.append(token_id)
+        kept_positions.append(pos)
+    return kept_ids, kept_positions
+
+
+def _find_unique_token_subsequence(haystack: List[int], needle: List[int]) -> Optional[int]:
+    if len(needle) == 0 or len(needle) > len(haystack):
+        return None
+
+    matches = []
+    max_start = len(haystack) - len(needle)
+    for start in range(max_start + 1):
+        if haystack[start:start + len(needle)] == needle:
+            matches.append(start)
+            if len(matches) > 1:
+                return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _get_offsets_for_sample(offset_mappings, sample_index: int):
+    if offset_mappings is None:
+        return None
+    if isinstance(offset_mappings, torch.Tensor):
+        return offset_mappings[sample_index].detach().cpu().tolist()
+    return offset_mappings[sample_index]
+
+
+def _token_indices_from_offsets(
+    offset_mappings,
+    sample_index: int,
+    char_span: Tuple[int, int],
+    input_ids,
+    attention_mask,
+    special_token_ids: set,
+) -> Optional[List[int]]:
+    offsets = _get_offsets_for_sample(offset_mappings, sample_index)
+    if offsets is None:
+        return None
+
+    char_start, char_end = char_span
+    ids = _as_1d_int_list(input_ids)
+    mask = _as_1d_int_list(attention_mask)
+    if not mask:
+        mask = [1] * len(ids)
+
+    token_indices: List[int] = []
+    for token_index, token_offsets in enumerate(offsets):
+        if token_index >= len(ids) or token_index >= len(mask) or mask[token_index] == 0:
+            continue
+        if ids[token_index] in special_token_ids:
+            continue
+        token_start, token_end = int(token_offsets[0]), int(token_offsets[1])
+        if token_end <= token_start:
+            continue
+        if token_start < char_end and token_end > char_start:
+            token_indices.append(token_index)
+
+    if len(token_indices) == 0:
+        return None
+    if token_indices[-1] - token_indices[0] + 1 != len(token_indices):
+        return None
+    return token_indices
+
+
+def _token_indices_from_token_ids(
+    tokenizer,
+    full_input_ids,
+    full_attention_mask,
+    intent_text: str,
+    special_token_ids: set,
+) -> Optional[List[int]]:
+    full_ids, full_positions = _strip_special_token_ids(
+        full_input_ids,
+        full_attention_mask,
+        special_token_ids,
+    )
+
+    intent_inputs = tokenizer(
+        intent_text,
+        padding=False,
+        truncation=True,
+        max_length=77,
+    )
+    intent_ids, _ = _strip_special_token_ids(
+        intent_inputs.get("input_ids"),
+        intent_inputs.get("attention_mask"),
+        special_token_ids,
+    )
+    match_start = _find_unique_token_subsequence(full_ids, intent_ids)
+    if match_start is None:
+        return None
+
+    token_indices = full_positions[match_start:match_start + len(intent_ids)]
+    if len(token_indices) == 0:
+        return None
+    if token_indices[-1] - token_indices[0] + 1 != len(token_indices):
+        return None
+    return token_indices
+
+
+def _find_intent_token_indices(
+    tokenizer,
+    full_text: str,
+    intent_text: str,
+    tokenized_full_inputs,
+    offset_mappings,
+    sample_index: int,
+    special_token_ids: set,
+) -> Optional[List[int]]:
+    char_span = _find_unique_normalized_char_span(full_text, intent_text)
+    if char_span is None:
+        return None
+
+    full_input_ids = tokenized_full_inputs["input_ids"][sample_index]
+    full_attention_mask = tokenized_full_inputs.get("attention_mask")
+    if full_attention_mask is not None:
+        full_attention_mask = full_attention_mask[sample_index]
+
+    if offset_mappings is not None:
+        return _token_indices_from_offsets(
+            offset_mappings=offset_mappings,
+            sample_index=sample_index,
+            char_span=char_span,
+            input_ids=full_input_ids,
+            attention_mask=full_attention_mask,
+            special_token_ids=special_token_ids,
+        )
+
+    return _token_indices_from_token_ids(
+        tokenizer=tokenizer,
+        full_input_ids=full_input_ids,
+        full_attention_mask=full_attention_mask,
+        intent_text=intent_text,
+        special_token_ids=special_token_ids,
+    )
+
+
 def save_model_logit_scale(
     model,
     save_dir: Union[str, Path],
@@ -704,110 +1040,6 @@ def compute_clip_ance_listwise_loss(
     return -(target_probs * log_pred_probs).sum(dim=-1).mean()
 
 
-def _compute_intent_features_from_multi_token(
-    fusion_module,
-    image_features: torch.Tensor,
-    text_features_list: List[torch.Tensor],
-) -> torch.Tensor:
-    """
-    Build one retrieval-space query feature per intent from a shared
-    multi-intent cross-attention token sequence.
-
-    Each per-intent feature reuses the same base/residual/gate equations as
-    CrossAttentionFusion.forward(). The only difference is that its context is
-    sliced from the full multi-intent token sequence, so each intent is still
-    aware of the other intents through the shared attention distribution.
-
-    Args:
-        fusion_module: CrossAttentionFusion instance.
-        image_features: [1, D] reference image feature for one sample.
-        text_features_list: list of [1, D], one text feature per single intent.
-
-    Returns:
-        intent_features: [1, k, D], where k is the number of single intents and
-        each slice is a retrieval-space output for one intent.
-    """
-    module_param = next(fusion_module.parameters())
-    compute_device = module_param.device
-    compute_dtype = module_param.dtype
-
-    image_features = F.normalize(
-        image_features.to(device=compute_device, dtype=compute_dtype),
-        dim=-1,
-    )
-
-    normalized_text_features = []
-    product_features_list = []
-    token_blocks = [fusion_module.image_proj(image_features)]
-    modality_ids = [0]
-
-    for text_features in text_features_list:
-        text_features = F.normalize(
-            text_features.to(device=compute_device, dtype=compute_dtype),
-            dim=-1,
-        )
-        product_features = image_features * text_features
-        delta_features = image_features - text_features
-
-        normalized_text_features.append(text_features)
-        product_features_list.append(product_features)
-        token_blocks.extend(
-            [
-                fusion_module.text_proj(text_features),
-                fusion_module.product_proj(product_features),
-                fusion_module.delta_proj(delta_features),
-            ]
-        )
-        modality_ids.extend([1, 2, 3])
-
-    tokens = torch.stack(token_blocks, dim=1)  # [1, 1+3k, D]
-    modality_ids_tensor = torch.tensor(modality_ids, device=compute_device, dtype=torch.long)
-    modality_embeddings = fusion_module.modality_embeddings.index_select(0, modality_ids_tensor)
-    tokens = fusion_module.token_norm(tokens + modality_embeddings.unsqueeze(0))
-
-    query_token = fusion_module.query_token.expand(image_features.shape[0], -1, -1)
-    query_token = query_token + fusion_module.image_proj(image_features).unsqueeze(1)
-
-    _, attn_weights = fusion_module.cross_attn(
-        query_token,
-        tokens,
-        tokens,
-        need_weights=True,
-        average_attn_weights=True,
-    )
-    attn_weights = attn_weights.squeeze(1)  # [1, 1+3k]
-
-    intent_contexts = []
-    for i in range(len(text_features_list)):
-        start = 1 + 3 * i
-        token_indices = torch.tensor([0, start, start + 1, start + 2], device=compute_device)
-        w = attn_weights.index_select(1, token_indices).unsqueeze(-1)  # [1, 4, 1]
-        v = tokens.index_select(1, token_indices)  # [1, 4, D]
-        context = (w * v).sum(dim=1)  # [1, D]
-        intent_contexts.append(fusion_module.context_norm(context))
-
-    repeated_image_features = image_features.expand(len(text_features_list), -1)
-    text_features = torch.cat(normalized_text_features, dim=0)
-    product_features = torch.cat(product_features_list, dim=0)
-    intent_contexts = torch.cat(intent_contexts, dim=0)
-
-    residual_input = torch.cat(
-        [repeated_image_features, text_features, product_features, intent_contexts],
-        dim=-1,
-    )
-    residual = fusion_module.residual_mlp(residual_input)
-    gate = torch.sigmoid(fusion_module.gate_mlp(residual_input))
-
-    base = (
-        fusion_module.image_residual_weight * repeated_image_features
-        + fusion_module.text_residual_weight * text_features
-    )
-    intent_features = base + fusion_module.update_scale * gate * residual
-    intent_features = F.normalize(intent_features, dim=-1)
-
-    return intent_features.unsqueeze(0)
-
-
 def compute_intent_consistency_loss(
     model,
     tokenizer,
@@ -819,32 +1051,43 @@ def compute_intent_consistency_loss(
     global_consistency_weight: float = 0.5,
     global_consistency_temperature: float = 0.2,
     consistency_epsilon: float = 0.05,
-) -> torch.Tensor:
+    return_stats: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
     """
-    Intent consistency loss based on the cross-attention fusion head.
+    Intent Consistency Learning based on the cross-attention fusion head.
 
-    - The edit for a single intent A_i is defined as the full fusion output
-      f(A_i, I).
-    - For A_i inside a complex query T=(A_1,...,A_k), build its context under a
-      shared multi-intent token attention setup, then reuse the forward
-      base/residual/gate path to obtain a retrieval-space output.
+    The isolated intent representation is composed from the reference image and
+    a single extracted intent. The contextual intent representation is obtained
+    by composing the reference image with the full modification text, then
+    mean-pooling the fused token states over the matched intent span.
 
-    The isolated single-intent fusion vector should match the retrieval-space
-    output obtained for the same intent inside the complex query's multi-token
-    cross-attention context. This keeps each intent from being distorted by the
-    others. At the same time, the full query feature is used as a detached
-    teacher so a relevance-weighted combination of per-intent features can
-    explain the full query feature. The local term uses a one-sided ReLU hinge,
-    and the weighted global term uses a cosine-distance ReLU hinge.
+    The local term keeps the contextual representation close to the isolated
+    one. The optional global term uses the full composed query as a detached
+    teacher for a relevance-weighted combination of contextual intent features.
 
     Active only for cross-attention fusion modules; other fusion types return 0.
     """
+    def _empty_result():
+        zero = torch.zeros((), device=device)
+        stats = {
+            "loss_ic": zero,
+            "loss_ic_local": zero,
+            "loss_ic_global": zero,
+            "ic_valid_spans": zero,
+            "ic_skipped_spans": zero,
+            "ic_valid_queries": zero,
+            "ic_multi_queries": zero,
+        }
+        if return_stats:
+            return zero, stats
+        return zero
+
     if single_intent_map is None or len(single_intent_map) == 0:
-        return torch.zeros((), device=device)
+        return _empty_result()
 
     fusion_module = get_model_cir_fusion(model)
     if fusion_module is None or getattr(fusion_module, "cross_attn", None) is None:
-        return torch.zeros((), device=device)
+        return _empty_result()
 
     multi_indices: List[int] = []
     multi_intent_texts: List[List[str]] = []
@@ -855,26 +1098,33 @@ def compute_intent_consistency_loss(
             multi_intent_texts.append(intents)
 
     if len(multi_indices) == 0:
-        return torch.zeros((), device=device)
+        return _empty_result()
 
     flat_intents: List[str] = []
     for intents in multi_intent_texts:
         flat_intents.extend(intents)
 
     if len(flat_intents) == 0:
-        return torch.zeros((), device=device)
+        return _empty_result()
 
-    inputs = tokenizer(
-        flat_intents,
-        padding=True,
-        truncation=True,
-        max_length=77,
-        return_tensors="pt",
-    ).to(device)
+    intent_inputs, _ = _tokenize_texts_for_intent_learning(
+        tokenizer=tokenizer,
+        texts=flat_intents,
+        device=device,
+        return_offsets=False,
+    )
+
+    full_texts = [input_captions[idx] for idx in multi_indices]
+    full_inputs, full_offset_mappings = _tokenize_texts_for_intent_learning(
+        tokenizer=tokenizer,
+        texts=full_texts,
+        device=device,
+        return_offsets=True,
+    )
 
     with torch.cuda.amp.autocast():
-        single_text_features = extract_clip_text_features(model, **inputs)
-        single_text_features = F.normalize(single_text_features, dim=-1)
+        intent_text_features = extract_clip_text_features(model, **intent_inputs)
+        intent_text_features = F.normalize(intent_text_features, dim=-1)
 
         # Reuse the corresponding reference image feature for each single intent.
         repeat_indices: List[int] = []
@@ -882,60 +1132,124 @@ def compute_intent_consistency_loss(
             repeat_indices.extend([idx] * len(intents))
         repeated_ref_features = ref_features[repeat_indices]
 
-        single_query_features = fusion_module(repeated_ref_features, single_text_features)
+        e_iso_all = fusion_module(repeated_ref_features, intent_text_features)
+
+        full_text_features = extract_clip_text_features(model, **full_inputs)
+        full_text_features = F.normalize(full_text_features, dim=-1)
+        full_token_features = extract_clip_text_token_features(model, **full_inputs)
+        full_token_features = F.normalize(full_token_features, dim=-1)
+        selected_ref_features = ref_features[multi_indices]
+        _, full_fused_token_features = fusion_module(
+            selected_ref_features,
+            full_text_features,
+            text_token_features=full_token_features,
+            text_attention_mask=full_inputs.get("attention_mask"),
+            return_token_features=True,
+        )
 
     global_consistency_weight = float(global_consistency_weight)
     global_consistency_temperature = max(float(global_consistency_temperature), 1e-6)
     consistency_epsilon = max(float(consistency_epsilon), 0.0)
+    special_token_ids = _get_special_token_ids(tokenizer)
 
-    # Compute multi-token per-intent outputs sample by sample, then apply local
-    # and weighted global consistency constraints.
     losses = []
+    local_losses = []
+    global_losses = []
+    skipped_span_mismatch = 0
+    valid_span_count = 0
+    valid_query_count = 0
     offset = 0
     for j, idx in enumerate(multi_indices):
         num_intents = len(multi_intent_texts[j])
         end = offset + num_intents
 
-        # Isolated single-intent fusion outputs: [k, D]
-        single_queries = single_query_features[offset:end]
+        e_iso_sample = e_iso_all[offset:end]
+        e_ctx_list = []
+        e_iso_list = []
+        for intent_position, intent_text in enumerate(multi_intent_texts[j]):
+            token_indices = _find_intent_token_indices(
+                tokenizer=tokenizer,
+                full_text=full_texts[j],
+                intent_text=intent_text,
+                tokenized_full_inputs=full_inputs,
+                offset_mappings=full_offset_mappings,
+                sample_index=j,
+                special_token_ids=special_token_ids,
+            )
+            if token_indices is None:
+                skipped_span_mismatch += 1
+                continue
 
-        # Build the multi-token setup and extract each intent's retrieval-space output.
-        img_feat = ref_features[idx:idx + 1]  # [1, D]
-        text_list = [single_text_features[offset + i:offset + i + 1] for i in range(num_intents)]
-        multi_intent_features = _compute_intent_features_from_multi_token(
-            fusion_module, img_feat, text_list
-        )  # [1, k, D]
-        multi_intent_features = multi_intent_features.squeeze(0)  # [k, D]
+            token_index_tensor = torch.tensor(
+                token_indices,
+                device=full_fused_token_features.device,
+                dtype=torch.long,
+            )
+            e_ctx = full_fused_token_features[j].index_select(0, token_index_tensor).mean(dim=0)
+            e_ctx_list.append(e_ctx)
+            e_iso_list.append(e_iso_sample[intent_position])
 
-        # ---------- Local consistency: ReLU(CrossAttn(I,T_NP_i) - CrossAttn(I,NP_i) - eps) ----------
-        # Here multi_intent_features is the in-context CrossAttn output, and
-        # single_queries is the isolated single-intent CrossAttn output.
-        loss_local = F.relu(
-            multi_intent_features - single_queries - consistency_epsilon
-        ).mean()
+        if len(e_ctx_list) == 0:
+            offset = end
+            continue
+
+        e_ctx = torch.stack(e_ctx_list, dim=0)
+        e_iso = torch.stack(e_iso_list, dim=0)
+        if e_iso.shape != e_ctx.shape:
+            raise ValueError(
+                "Intent Consistency Learning shape mismatch: "
+                f"e_iso.shape={tuple(e_iso.shape)}, e_ctx.shape={tuple(e_ctx.shape)}"
+            )
+        valid_span_count += e_ctx.shape[0]
+        valid_query_count += 1
+
+        cos_sim_local = F.cosine_similarity(e_ctx, e_iso, dim=-1)
+        loss_local = F.relu((1.0 - cos_sim_local) - consistency_epsilon).mean()
+        local_losses.append(loss_local)
 
         if global_consistency_weight > 0.0:
-            # ---------- Global consistency: full query feature ~= weighted per-intent features ----------
             full_query_teacher = F.normalize(query_features[idx].detach(), dim=-1)
             with torch.no_grad():
-                multi_norm = F.normalize(multi_intent_features, dim=-1)
-                intent_sims = (multi_norm * full_query_teacher.unsqueeze(0)).sum(dim=-1)
+                e_ctx_norm = F.normalize(e_ctx, dim=-1)
+                intent_sims = (e_ctx_norm * full_query_teacher.unsqueeze(0)).sum(dim=-1)
                 intent_weights = F.softmax(
                     intent_sims / global_consistency_temperature,
                     dim=0,
                 )
 
-            weighted_features = (intent_weights.unsqueeze(-1) * multi_intent_features).sum(dim=0)
+            weighted_features = (intent_weights.unsqueeze(-1) * e_ctx).sum(dim=0)
             weighted_features_norm = F.normalize(weighted_features.unsqueeze(0), dim=-1).squeeze(0)
             cos_sim_global = (full_query_teacher * weighted_features_norm).sum().clamp(min=-1.0, max=1.0)
             loss_global = F.relu((1.0 - cos_sim_global) - consistency_epsilon)
+            global_losses.append(loss_global)
             losses.append(loss_local + global_consistency_weight * loss_global)
         else:
             losses.append(loss_local)
         offset = end
 
-    loss = torch.stack(losses).mean()
-    return loss
+    if skipped_span_mismatch > 0:
+        logger.debug(
+            "Intent Consistency Learning skipped %d intent spans due to span mismatch.",
+            skipped_span_mismatch,
+        )
+    if len(losses) == 0 or valid_span_count == 0:
+        return _empty_result()
+
+    loss_ic = torch.stack(losses).mean()
+    if not return_stats:
+        return loss_ic
+
+    zero = torch.zeros((), device=device)
+    stats = {
+        "loss_ic": loss_ic.detach(),
+        "loss_ic_local": torch.stack(local_losses).mean().detach() if local_losses else zero,
+        "loss_ic_global": torch.stack(global_losses).mean().detach() if global_losses else zero,
+        "ic_valid_spans": torch.tensor(float(valid_span_count), device=device),
+        "ic_skipped_spans": torch.tensor(float(skipped_span_mismatch), device=device),
+        "ic_valid_queries": torch.tensor(float(valid_query_count), device=device),
+        "ic_multi_queries": torch.tensor(float(len(multi_indices)), device=device),
+    }
+    return loss_ic, stats
 
 
 def _compute_soft_orthogonality_loss(embeddings: torch.Tensor) -> torch.Tensor:

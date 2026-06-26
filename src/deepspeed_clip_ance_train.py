@@ -139,6 +139,95 @@ def all_reduce_sum(dist_info: dict, t: torch.Tensor) -> torch.Tensor:
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t
 
+INTENT_CONSISTENCY_LOSS_KEYS = (
+    "loss_ic",
+    "loss_ic_weighted",
+    "loss_ic_local",
+    "loss_ic_global",
+)
+INTENT_CONSISTENCY_COUNT_KEYS = (
+    "ic_valid_spans",
+    "ic_skipped_spans",
+    "ic_valid_queries",
+    "ic_multi_queries",
+)
+
+
+def make_empty_intent_consistency_stats(device: torch.device) -> dict:
+    zero = torch.zeros((), device=device)
+    return {
+        "loss_ic": zero,
+        "loss_ic_weighted": zero,
+        "loss_ic_local": zero,
+        "loss_ic_global": zero,
+        "ic_valid_spans": zero,
+        "ic_skipped_spans": zero,
+        "ic_valid_queries": zero,
+        "ic_multi_queries": zero,
+    }
+
+
+def make_train_running_results() -> dict:
+    results = {
+        "accumulated_train_loss": 0.0,
+        "images_in_epoch": 0,
+    }
+    for key in INTENT_CONSISTENCY_LOSS_KEYS:
+        results[f"accumulated_{key}"] = 0.0
+    for key in INTENT_CONSISTENCY_COUNT_KEYS:
+        results[key] = 0.0
+    return results
+
+
+def update_intent_consistency_running_results(
+    train_running_results: dict,
+    stats: dict,
+    images_in_batch: int,
+) -> None:
+    for key in INTENT_CONSISTENCY_LOSS_KEYS:
+        value = stats.get(key)
+        if value is None:
+            continue
+        train_running_results[f"accumulated_{key}"] += (
+            value.detach().float().cpu().item() * images_in_batch
+        )
+
+    for key in INTENT_CONSISTENCY_COUNT_KEYS:
+        value = stats.get(key)
+        if value is None:
+            continue
+        train_running_results[key] += value.detach().float().cpu().item()
+
+
+def reduce_intent_consistency_epoch_stats(
+    dist_info: dict,
+    train_running_results: dict,
+    device: torch.device,
+    total_imgs: torch.Tensor,
+) -> dict:
+    log_stats = {}
+    denom = max(int(total_imgs.item()), 1)
+
+    for key in INTENT_CONSISTENCY_LOSS_KEYS:
+        total_value = torch.tensor(
+            [train_running_results.get(f"accumulated_{key}", 0.0)],
+            device=device,
+            dtype=torch.float32,
+        )
+        total_value = all_reduce_sum(dist_info, total_value)
+        log_stats[key] = total_value.item() / denom
+
+    for key in INTENT_CONSISTENCY_COUNT_KEYS:
+        total_value = torch.tensor(
+            [train_running_results.get(key, 0.0)],
+            device=device,
+            dtype=torch.float32,
+        )
+        total_value = all_reduce_sum(dist_info, total_value)
+        log_stats[key] = total_value.item()
+
+    return log_stats
+
 def make_model_tensors_contiguous(model) -> None:
     """Ensure DeepSpeed can broadcast all model tensors during initialization."""
     fixed_parameters = []
@@ -1001,7 +1090,7 @@ def clip_finetune_fiq_ance(
                 num_workers=kwargs.get("num_workers", 4)
             )
 
-        train_running_results = {"accumulated_train_loss": 0.0, "images_in_epoch": 0}
+        train_running_results = make_train_running_results()
         train_iter = relative_train_loader
         train_bar = tqdm(train_iter, ncols=150, disable=not is_main_process(dist_info))
 
@@ -1135,8 +1224,9 @@ def clip_finetune_fiq_ance(
 
             # Intent losses are independent of the ANCE/listwise branch and
             # should also apply to plain in-batch contrastive training.
+            intent_consistency_stats = make_empty_intent_consistency_stats(device)
             if intent_consistency_weight > 0.0 and single_intent_map is not None:
-                ic_loss = compute_intent_consistency_loss(
+                loss_ic, intent_consistency_stats = compute_intent_consistency_loss(
                     model=model_engine.module,
                     tokenizer=tokenizer,
                     ref_features=ref_features,
@@ -1147,8 +1237,11 @@ def clip_finetune_fiq_ance(
                     global_consistency_weight=intent_global_consistency_weight,
                     global_consistency_temperature=intent_global_consistency_temperature,
                     consistency_epsilon=intent_consistency_epsilon,
+                    return_stats=True,
                 )
-                loss = loss + intent_consistency_weight * ic_loss
+                weighted_loss_ic = intent_consistency_weight * loss_ic
+                intent_consistency_stats["loss_ic_weighted"] = weighted_loss_ic.detach()
+                loss = loss + weighted_loss_ic
 
             if intent_orthogonality_weight > 0.0 and single_intent_map is not None:
                 io_loss = compute_intent_orthogonality_loss(
@@ -1173,6 +1266,11 @@ def clip_finetune_fiq_ance(
                 scheduler.step()
 
             update_train_running_results(train_running_results, loss_for_logging, images_in_batch)
+            update_intent_consistency_running_results(
+                train_running_results,
+                intent_consistency_stats,
+                images_in_batch,
+            )
             if is_main_process(dist_info):
                 set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
 
@@ -1181,6 +1279,12 @@ def clip_finetune_fiq_ance(
         total_imgs = torch.tensor([train_running_results["images_in_epoch"]], device=device, dtype=torch.long)
         total_loss = all_reduce_sum(dist_info, total_loss)
         total_imgs = all_reduce_sum(dist_info, total_imgs)
+        intent_log_dict = reduce_intent_consistency_epoch_stats(
+            dist_info,
+            train_running_results,
+            device,
+            total_imgs,
+        )
 
         if is_main_process(dist_info):
             avg_loss = (total_loss.item() / max(int(total_imgs.item()), 1))
@@ -1188,6 +1292,7 @@ def clip_finetune_fiq_ance(
                 get_similarity_scale(logit_scale=train_logit_scale).detach().cpu().item()
             )
             loss_log_dict = {"epoch": epoch, "loss": avg_loss, "temperature": current_temperature}
+            loss_log_dict.update(intent_log_dict)
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
             training_log_frame.to_csv(str(training_path / "train_metrics.csv"), index=False)
 
@@ -1515,7 +1620,7 @@ def clip_finetune_single_text_ance(
                 num_workers=kwargs.get("num_workers", 4)
             )
 
-        train_running_results = {"accumulated_train_loss": 0.0, "images_in_epoch": 0}
+        train_running_results = make_train_running_results()
         train_bar = tqdm(relative_train_loader, ncols=150, disable=not is_main_process(dist_info))
 
         for step, (reference_images, target_images, captions, target_names) in enumerate(train_bar):
@@ -1643,8 +1748,9 @@ def clip_finetune_single_text_ance(
 
             # Intent losses are independent of the ANCE/listwise branch and
             # should also apply to plain in-batch contrastive training.
+            intent_consistency_stats = make_empty_intent_consistency_stats(device)
             if intent_consistency_weight > 0.0 and single_intent_map is not None:
-                ic_loss = compute_intent_consistency_loss(
+                loss_ic, intent_consistency_stats = compute_intent_consistency_loss(
                     model=model_engine.module,
                     tokenizer=tokenizer,
                     ref_features=ref_features,
@@ -1655,8 +1761,11 @@ def clip_finetune_single_text_ance(
                     global_consistency_weight=intent_global_consistency_weight,
                     global_consistency_temperature=intent_global_consistency_temperature,
                     consistency_epsilon=intent_consistency_epsilon,
+                    return_stats=True,
                 )
-                loss = loss + intent_consistency_weight * ic_loss
+                weighted_loss_ic = intent_consistency_weight * loss_ic
+                intent_consistency_stats["loss_ic_weighted"] = weighted_loss_ic.detach()
+                loss = loss + weighted_loss_ic
 
             if intent_orthogonality_weight > 0.0 and single_intent_map is not None:
                 io_loss = compute_intent_orthogonality_loss(
@@ -1679,6 +1788,11 @@ def clip_finetune_single_text_ance(
                 scheduler.step()
 
             update_train_running_results(train_running_results, loss_for_logging, images_in_batch)
+            update_intent_consistency_running_results(
+                train_running_results,
+                intent_consistency_stats,
+                images_in_batch,
+            )
             if is_main_process(dist_info):
                 set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
 
@@ -1686,6 +1800,12 @@ def clip_finetune_single_text_ance(
         total_imgs = torch.tensor([train_running_results["images_in_epoch"]], device=device, dtype=torch.long)
         total_loss = all_reduce_sum(dist_info, total_loss)
         total_imgs = all_reduce_sum(dist_info, total_imgs)
+        intent_log_dict = reduce_intent_consistency_epoch_stats(
+            dist_info,
+            train_running_results,
+            device,
+            total_imgs,
+        )
 
         if is_main_process(dist_info):
             avg_loss = (total_loss.item() / max(int(total_imgs.item()), 1))
@@ -1693,6 +1813,7 @@ def clip_finetune_single_text_ance(
                 get_similarity_scale(logit_scale=train_logit_scale).detach().cpu().item()
             )
             loss_log_dict = {"epoch": epoch, "loss": avg_loss, "temperature": current_temperature}
+            loss_log_dict.update(intent_log_dict)
             training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
             training_log_frame.to_csv(str(training_path / "train_metrics.csv"), index=False)
 
@@ -1818,15 +1939,15 @@ if __name__ == "__main__":
     parser.add_argument("--single-intent-queries-path", type=str, default=None,
                         help="Path to single intent decomposition JSON file (e.g., fiq_single_intent_queries.json)")
     parser.add_argument("--intent-consistency-weight", type=float, default=0.0,
-                        help="Weight for the intent consistency loss on multi-intent queries (cross-attn only).")
+                        help="Weight for Intent Consistency Learning on multi-intent queries (cross-attn only).")
     parser.add_argument("--intent-orthogonality-weight", type=float, default=0.0,
                         help="Weight for the soft orthogonality loss between intents in multi-intent queries (cross-attn only).")
     parser.add_argument("--intent-global-consistency-weight", type=float, default=0.5,
-                        help="Relative weight of the weighted global consistency term inside intent consistency loss.")
+                        help="Relative weight of the weighted global term inside Intent Consistency Learning.")
     parser.add_argument("--intent-global-consistency-temperature", type=float, default=0.2,
                         help="Softmax temperature for weighting single-intent features in global consistency.")
     parser.add_argument("--intent-consistency-epsilon", type=float, default=0.05,
-                        help="Hinge margin epsilon for local/global intent consistency cosine distance.")
+                        help="Hinge margin epsilon for local/global Intent Consistency Learning distance.")
 
     # LoRA
     parser.add_argument("--use-lora", action="store_true")
