@@ -1051,22 +1051,64 @@ def compute_intent_consistency_loss(
     global_consistency_weight: float = 0.5,
     global_consistency_temperature: float = 0.2,
     consistency_epsilon: float = 0.05,
+    consistency_mode: str = "counterfactual_delta",
     return_stats: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
     """
     Intent Consistency Learning based on the cross-attention fusion head.
 
     The isolated intent representation is composed from the reference image and
-    a single extracted intent. The contextual intent representation is obtained
-    by composing the reference image with the full modification text, then
-    mean-pooling the fused token states over the matched intent span.
+    a single extracted intent. Depending on the mode, the contextual intent is
+    either a counterfactual marginal query delta or a full-text token-span
+    representation.
 
-    The local term keeps the contextual representation close to the isolated
-    one. The optional global term uses the full composed query as a detached
-    teacher for a relevance-weighted combination of contextual intent features.
+    The counterfactual_delta mode defines the contextual intent representation
+    as the marginal effect of that intent on the final retrieval query:
+    full_query - query_without_that_intent. It is aligned with the isolated
+    single-intent effect: single_intent_query - reference_image_query.
+
+    The direction mode keeps the intent-specific edit direction consistent:
+    contextual_intent - reference_image should match isolated_intent -
+    reference_image. This keeps the loss as a same-intent consistency objective
+    while reducing domination from the shared reference image component. The
+    feature mode preserves the previous raw cosine hinge. The contrastive mode
+    is kept as an opt-in experiment. In counterfactual_delta mode, the optional
+    global term uses the full composed query as a detached teacher for a
+    relevance-weighted reconstruction from isolated single-intent deltas.
 
     Active only for cross-attention fusion modules; other fusion types return 0.
     """
+    def _bidirectional_contrastive_loss(
+        anchor_features: torch.Tensor,
+        positive_features: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        if anchor_features.shape[0] != positive_features.shape[0]:
+            raise ValueError(
+                "Contrastive consistency expects paired tensors with the same "
+                f"batch size, got {anchor_features.shape[0]} and {positive_features.shape[0]}"
+            )
+        if anchor_features.shape[0] <= 1:
+            cos_sim = F.cosine_similarity(anchor_features, positive_features, dim=-1)
+            return F.relu((1.0 - cos_sim) - consistency_epsilon).mean()
+
+        anchor_norm = F.normalize(anchor_features.float(), dim=-1)
+        positive_norm = F.normalize(positive_features.float(), dim=-1)
+        logits = torch.matmul(anchor_norm, positive_norm.T) / temperature
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        return 0.5 * (
+            F.cross_entropy(logits, labels)
+            + F.cross_entropy(logits.T, labels)
+        )
+
+    def _join_remaining_intents(intents: List[str], removed_position: int) -> str:
+        remaining = [
+            intent.strip()
+            for pos, intent in enumerate(intents)
+            if pos != removed_position and intent.strip()
+        ]
+        return " ".join(remaining)
+
     def _empty_result():
         zero = torch.zeros((), device=device)
         stats = {
@@ -1107,6 +1149,19 @@ def compute_intent_consistency_loss(
     if len(flat_intents) == 0:
         return _empty_result()
 
+    global_consistency_weight = float(global_consistency_weight)
+    global_consistency_temperature = max(float(global_consistency_temperature), 1e-6)
+    consistency_epsilon = max(float(consistency_epsilon), 0.0)
+    consistency_mode = str(consistency_mode).strip().lower()
+    if consistency_mode == "counterfactual":
+        consistency_mode = "counterfactual_delta"
+    if consistency_mode not in {"counterfactual_delta", "direction", "feature", "contrastive", "hybrid"}:
+        raise ValueError(
+            "Unsupported intent consistency mode: "
+            f"{consistency_mode!r}. Expected one of: counterfactual_delta, "
+            "direction, feature, contrastive, hybrid."
+        )
+
     intent_inputs, _ = _tokenize_texts_for_intent_learning(
         tokenizer=tokenizer,
         texts=flat_intents,
@@ -1115,12 +1170,24 @@ def compute_intent_consistency_loss(
     )
 
     full_texts = [input_captions[idx] for idx in multi_indices]
-    full_inputs, full_offset_mappings = _tokenize_texts_for_intent_learning(
-        tokenizer=tokenizer,
-        texts=full_texts,
-        device=device,
-        return_offsets=True,
-    )
+    if consistency_mode == "counterfactual_delta":
+        without_intent_texts: List[str] = []
+        for intents in multi_intent_texts:
+            for intent_position in range(len(intents)):
+                without_intent_texts.append(_join_remaining_intents(intents, intent_position))
+        without_inputs, _ = _tokenize_texts_for_intent_learning(
+            tokenizer=tokenizer,
+            texts=without_intent_texts,
+            device=device,
+            return_offsets=False,
+        )
+    else:
+        full_inputs, full_offset_mappings = _tokenize_texts_for_intent_learning(
+            tokenizer=tokenizer,
+            texts=full_texts,
+            device=device,
+            return_offsets=True,
+        )
 
     with torch.cuda.amp.autocast():
         intent_text_features = extract_clip_text_features(model, **intent_inputs)
@@ -1134,27 +1201,37 @@ def compute_intent_consistency_loss(
 
         e_iso_all = fusion_module(repeated_ref_features, intent_text_features)
 
-        full_text_features = extract_clip_text_features(model, **full_inputs)
-        full_text_features = F.normalize(full_text_features, dim=-1)
-        full_token_features = extract_clip_text_token_features(model, **full_inputs)
-        full_token_features = F.normalize(full_token_features, dim=-1)
         selected_ref_features = ref_features[multi_indices]
-        _, full_fused_token_features = fusion_module(
-            selected_ref_features,
-            full_text_features,
-            text_token_features=full_token_features,
-            text_attention_mask=full_inputs.get("attention_mask"),
-            return_token_features=True,
-        )
+        if consistency_mode in {"counterfactual_delta", "direction"}:
+            with torch.no_grad():
+                ref_anchor_features = compose_image_features(model, selected_ref_features)
 
-    global_consistency_weight = float(global_consistency_weight)
-    global_consistency_temperature = max(float(global_consistency_temperature), 1e-6)
-    consistency_epsilon = max(float(consistency_epsilon), 0.0)
+        if consistency_mode == "counterfactual_delta":
+            with torch.no_grad():
+                without_text_features = extract_clip_text_features(model, **without_inputs)
+                without_text_features = F.normalize(without_text_features, dim=-1)
+                q_without_all = fusion_module(repeated_ref_features, without_text_features)
+        else:
+            full_text_features = extract_clip_text_features(model, **full_inputs)
+            full_text_features = F.normalize(full_text_features, dim=-1)
+            full_token_features = extract_clip_text_token_features(model, **full_inputs)
+            full_token_features = F.normalize(full_token_features, dim=-1)
+            _, full_fused_token_features = fusion_module(
+                selected_ref_features,
+                full_text_features,
+                text_token_features=full_token_features,
+                text_attention_mask=full_inputs.get("attention_mask"),
+                return_token_features=True,
+            )
+
     special_token_ids = _get_special_token_ids(tokenizer)
 
-    losses = []
-    local_losses = []
-    global_losses = []
+    feature_local_losses = []
+    feature_global_losses = []
+    contrastive_ctx_features = []
+    contrastive_iso_features = []
+    global_student_features = []
+    global_teacher_features = []
     skipped_span_mismatch = 0
     valid_span_count = 0
     valid_query_count = 0
@@ -1164,67 +1241,113 @@ def compute_intent_consistency_loss(
         end = offset + num_intents
 
         e_iso_sample = e_iso_all[offset:end]
-        e_ctx_list = []
-        e_iso_list = []
-        for intent_position, intent_text in enumerate(multi_intent_texts[j]):
-            token_indices = _find_intent_token_indices(
-                tokenizer=tokenizer,
-                full_text=full_texts[j],
-                intent_text=intent_text,
-                tokenized_full_inputs=full_inputs,
-                offset_mappings=full_offset_mappings,
-                sample_index=j,
-                special_token_ids=special_token_ids,
-            )
-            if token_indices is None:
-                skipped_span_mismatch += 1
+        e_iso = e_iso_sample
+
+        if consistency_mode == "counterfactual_delta":
+            q_without = q_without_all[offset:end]
+            q_full = query_features[idx].unsqueeze(0).expand_as(q_without)
+            ref_anchor = ref_anchor_features[j].unsqueeze(0)
+            ctx_delta = q_full - q_without
+            iso_delta = e_iso - ref_anchor
+            local_ctx = F.normalize(ctx_delta, dim=-1)
+            local_iso = F.normalize(iso_delta, dim=-1)
+            valid_span_count += e_iso.shape[0]
+        else:
+            e_ctx_list = []
+            e_iso_list = []
+            for intent_position, intent_text in enumerate(multi_intent_texts[j]):
+                token_indices = _find_intent_token_indices(
+                    tokenizer=tokenizer,
+                    full_text=full_texts[j],
+                    intent_text=intent_text,
+                    tokenized_full_inputs=full_inputs,
+                    offset_mappings=full_offset_mappings,
+                    sample_index=j,
+                    special_token_ids=special_token_ids,
+                )
+                if token_indices is None:
+                    skipped_span_mismatch += 1
+                    continue
+
+                token_index_tensor = torch.tensor(
+                    token_indices,
+                    device=full_fused_token_features.device,
+                    dtype=torch.long,
+                )
+                e_ctx = full_fused_token_features[j].index_select(0, token_index_tensor).mean(dim=0)
+                e_ctx_list.append(e_ctx)
+                e_iso_list.append(e_iso_sample[intent_position])
+
+            if len(e_ctx_list) == 0:
+                offset = end
                 continue
 
-            token_index_tensor = torch.tensor(
-                token_indices,
-                device=full_fused_token_features.device,
-                dtype=torch.long,
-            )
-            e_ctx = full_fused_token_features[j].index_select(0, token_index_tensor).mean(dim=0)
-            e_ctx_list.append(e_ctx)
-            e_iso_list.append(e_iso_sample[intent_position])
+            e_ctx = torch.stack(e_ctx_list, dim=0)
+            e_iso = torch.stack(e_iso_list, dim=0)
+            if e_iso.shape != e_ctx.shape:
+                raise ValueError(
+                    "Intent Consistency Learning shape mismatch: "
+                    f"e_iso.shape={tuple(e_iso.shape)}, e_ctx.shape={tuple(e_ctx.shape)}"
+                )
+            valid_span_count += e_ctx.shape[0]
 
-        if len(e_ctx_list) == 0:
-            offset = end
-            continue
+            if consistency_mode == "direction":
+                ref_anchor = ref_anchor_features[j].detach().unsqueeze(0)
+                local_ctx = F.normalize(e_ctx - ref_anchor, dim=-1)
+                local_iso = F.normalize(e_iso - ref_anchor, dim=-1)
+            else:
+                local_ctx = e_ctx
+                local_iso = e_iso
 
-        e_ctx = torch.stack(e_ctx_list, dim=0)
-        e_iso = torch.stack(e_iso_list, dim=0)
-        if e_iso.shape != e_ctx.shape:
-            raise ValueError(
-                "Intent Consistency Learning shape mismatch: "
-                f"e_iso.shape={tuple(e_iso.shape)}, e_ctx.shape={tuple(e_ctx.shape)}"
-            )
-        valid_span_count += e_ctx.shape[0]
         valid_query_count += 1
 
-        cos_sim_local = F.cosine_similarity(e_ctx, e_iso, dim=-1)
-        loss_local = F.relu((1.0 - cos_sim_local) - consistency_epsilon).mean()
-        local_losses.append(loss_local)
+        cos_sim_local = F.cosine_similarity(local_ctx, local_iso, dim=-1)
+        feature_loss_local = F.relu((1.0 - cos_sim_local) - consistency_epsilon).mean()
+        feature_local_losses.append(feature_loss_local)
+        contrastive_ctx_features.append(local_ctx)
+        contrastive_iso_features.append(local_iso)
 
         if global_consistency_weight > 0.0:
             full_query_teacher = F.normalize(query_features[idx].detach(), dim=-1)
-            with torch.no_grad():
-                e_ctx_norm = F.normalize(e_ctx, dim=-1)
-                intent_sims = (e_ctx_norm * full_query_teacher.unsqueeze(0)).sum(dim=-1)
-                intent_weights = F.softmax(
-                    intent_sims / global_consistency_temperature,
-                    dim=0,
+            if consistency_mode == "counterfactual_delta":
+                ref_anchor = ref_anchor_features[j]
+                full_query_teacher_for_loss = F.normalize(
+                    full_query_teacher - ref_anchor,
+                    dim=-1,
                 )
+                with torch.no_grad():
+                    intent_sims = (local_iso * full_query_teacher_for_loss.unsqueeze(0)).sum(dim=-1)
+                    intent_weights = F.softmax(
+                        intent_sims / global_consistency_temperature,
+                        dim=0,
+                    )
+                weighted_delta = (intent_weights.unsqueeze(-1) * iso_delta).sum(dim=0)
+                weighted_features_for_loss = F.normalize(weighted_delta, dim=-1)
+            else:
+                with torch.no_grad():
+                    e_ctx_norm = F.normalize(e_ctx, dim=-1)
+                    intent_sims = (e_ctx_norm * full_query_teacher.unsqueeze(0)).sum(dim=-1)
+                    intent_weights = F.softmax(
+                        intent_sims / global_consistency_temperature,
+                        dim=0,
+                    )
 
-            weighted_features = (intent_weights.unsqueeze(-1) * e_ctx).sum(dim=0)
-            weighted_features_norm = F.normalize(weighted_features.unsqueeze(0), dim=-1).squeeze(0)
-            cos_sim_global = (full_query_teacher * weighted_features_norm).sum().clamp(min=-1.0, max=1.0)
-            loss_global = F.relu((1.0 - cos_sim_global) - consistency_epsilon)
-            global_losses.append(loss_global)
-            losses.append(loss_local + global_consistency_weight * loss_global)
-        else:
-            losses.append(loss_local)
+                weighted_features = (intent_weights.unsqueeze(-1) * e_ctx).sum(dim=0)
+                if consistency_mode == "direction":
+                    ref_anchor = ref_anchor_features[j].detach()
+                    weighted_features_for_loss = F.normalize(weighted_features - ref_anchor, dim=-1)
+                    full_query_teacher_for_loss = F.normalize(full_query_teacher - ref_anchor, dim=-1)
+                else:
+                    weighted_features_for_loss = F.normalize(weighted_features.unsqueeze(0), dim=-1).squeeze(0)
+                    full_query_teacher_for_loss = full_query_teacher
+
+            cos_sim_global = (
+                full_query_teacher_for_loss * weighted_features_for_loss
+            ).sum().clamp(min=-1.0, max=1.0)
+            feature_loss_global = F.relu((1.0 - cos_sim_global) - consistency_epsilon)
+            feature_global_losses.append(feature_loss_global)
+            global_student_features.append(weighted_features_for_loss)
+            global_teacher_features.append(full_query_teacher_for_loss)
         offset = end
 
     if skipped_span_mismatch > 0:
@@ -1232,18 +1355,55 @@ def compute_intent_consistency_loss(
             "Intent Consistency Learning skipped %d intent spans due to span mismatch.",
             skipped_span_mismatch,
         )
-    if len(losses) == 0 or valid_span_count == 0:
+    if len(feature_local_losses) == 0 or valid_span_count == 0:
         return _empty_result()
 
-    loss_ic = torch.stack(losses).mean()
+    feature_loss_local = torch.stack(feature_local_losses).mean()
+    zero = torch.zeros((), device=device)
+    feature_loss_global = (
+        torch.stack(feature_global_losses).mean()
+        if feature_global_losses
+        else zero
+    )
+
+    if consistency_mode in {"counterfactual_delta", "direction", "feature"}:
+        loss_local = feature_loss_local
+        loss_global = feature_loss_global
+    else:
+        all_ctx = torch.cat(contrastive_ctx_features, dim=0)
+        all_iso = torch.cat(contrastive_iso_features, dim=0)
+        contrastive_loss_local = _bidirectional_contrastive_loss(
+            all_ctx,
+            all_iso,
+            global_consistency_temperature,
+        )
+
+        if global_consistency_weight > 0.0 and global_student_features:
+            students = torch.stack(global_student_features, dim=0)
+            teachers = torch.stack(global_teacher_features, dim=0)
+            contrastive_loss_global = _bidirectional_contrastive_loss(
+                students,
+                teachers.detach(),
+                global_consistency_temperature,
+            )
+        else:
+            contrastive_loss_global = zero
+
+        if consistency_mode == "hybrid":
+            loss_local = 0.5 * (feature_loss_local + contrastive_loss_local)
+            loss_global = 0.5 * (feature_loss_global + contrastive_loss_global)
+        else:
+            loss_local = contrastive_loss_local
+            loss_global = contrastive_loss_global
+
+    loss_ic = loss_local + global_consistency_weight * loss_global
     if not return_stats:
         return loss_ic
 
-    zero = torch.zeros((), device=device)
     stats = {
         "loss_ic": loss_ic.detach(),
-        "loss_ic_local": torch.stack(local_losses).mean().detach() if local_losses else zero,
-        "loss_ic_global": torch.stack(global_losses).mean().detach() if global_losses else zero,
+        "loss_ic_local": loss_local.detach(),
+        "loss_ic_global": loss_global.detach(),
         "ic_valid_spans": torch.tensor(float(valid_span_count), device=device),
         "ic_skipped_spans": torch.tensor(float(skipped_span_mismatch), device=device),
         "ic_valid_queries": torch.tensor(float(valid_query_count), device=device),
@@ -1291,13 +1451,13 @@ def compute_intent_orthogonality_loss(
     Soft orthogonality loss between intents.
 
     For a multi-intent query T=(A_1, ..., A_k) with k >= 2, encourage the
-    retrieval-space query features produced by the fusion head for each single
+    retrieval-space edit directions produced by the fusion head for each single
     intent to be mutually orthogonal:
 
-        <f(I, A_i), f(I, A_j)> ~= 0    (i != j)
+        <f(I, A_i) - f(I, blank), f(I, A_j) - f(I, blank)> ~= 0    (i != j)
 
-    This encourages query representations for different intents to be
-    disentangled, so one intent is less likely to be pulled by another. The
+    This encourages intent-specific changes, not the shared reference-image
+    component, to be disentangled. The
     embeddings are first L2-normalized along the feature dimension, then the
     differentiable soft orthogonality penalty is computed as:
     2 / (K * (K - 1)) * sum_{i<j} (<e_i, e_j>)^2
@@ -1349,15 +1509,20 @@ def compute_intent_orthogonality_loss(
         # Isolated single-intent fusion outputs: [sum_k, D]
         single_query_features = fusion_module(repeated_ref_features, single_text_features)
 
+        selected_ref_features = ref_features[multi_indices]
+        with torch.no_grad():
+            ref_anchor_features = compose_image_features(model, selected_ref_features)
+
     losses = []
     offset = 0
     for j in range(len(multi_indices)):
         num_intents = len(multi_intent_texts[j])
         end = offset + num_intents
 
-        # Compute soft orthogonality directly from each single-intent fused query feature.
-        single_queries = single_query_features[offset:end]  # [k, D]
-        losses.append(_compute_soft_orthogonality_loss(single_queries))
+        # Match the consistency loss isolated side: q_i - q_ref.
+        ref_anchor = ref_anchor_features[j].unsqueeze(0)
+        single_query_deltas = single_query_features[offset:end] - ref_anchor  # [k, D]
+        losses.append(_compute_soft_orthogonality_loss(single_query_deltas))
 
         offset = end
 

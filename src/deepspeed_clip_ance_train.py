@@ -854,6 +854,7 @@ def clip_finetune_fiq_ance(
     intent_global_consistency_weight = float(kwargs.get("intent_global_consistency_weight", 0.5))
     intent_global_consistency_temperature = float(kwargs.get("intent_global_consistency_temperature", 0.2))
     intent_consistency_epsilon = float(kwargs.get("intent_consistency_epsilon", 0.05))
+    intent_consistency_mode = kwargs.get("intent_consistency_mode", "counterfactual_delta")
     use_ranked_training = listwise_weight > 0.0
     fashioniq_val_split_mode = kwargs.get("fashioniq_val_split_mode", "original-split")
 
@@ -909,6 +910,7 @@ def clip_finetune_fiq_ance(
             "intent_global_consistency_weight": intent_global_consistency_weight,
             "intent_global_consistency_temperature": intent_global_consistency_temperature,
             "intent_consistency_epsilon": intent_consistency_epsilon,
+            "intent_consistency_mode": intent_consistency_mode,
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -1237,6 +1239,7 @@ def clip_finetune_fiq_ance(
                     global_consistency_weight=intent_global_consistency_weight,
                     global_consistency_temperature=intent_global_consistency_temperature,
                     consistency_epsilon=intent_consistency_epsilon,
+                    consistency_mode=intent_consistency_mode,
                     return_stats=True,
                 )
                 weighted_loss_ic = intent_consistency_weight * loss_ic
@@ -1415,6 +1418,7 @@ def clip_finetune_single_text_ance(
     intent_global_consistency_weight = float(kwargs.get("intent_global_consistency_weight", 0.5))
     intent_global_consistency_temperature = float(kwargs.get("intent_global_consistency_temperature", 0.2))
     intent_consistency_epsilon = float(kwargs.get("intent_consistency_epsilon", 0.05))
+    intent_consistency_mode = kwargs.get("intent_consistency_mode", "counterfactual_delta")
     use_ranked_training = listwise_weight > 0.0
 
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
@@ -1469,6 +1473,7 @@ def clip_finetune_single_text_ance(
             "intent_global_consistency_weight": intent_global_consistency_weight,
             "intent_global_consistency_temperature": intent_global_consistency_temperature,
             "intent_consistency_epsilon": intent_consistency_epsilon,
+            "intent_consistency_mode": intent_consistency_mode,
             "use_lora": use_lora,
             "lora_r": lora_r,
             "lora_alpha": lora_alpha,
@@ -1761,6 +1766,7 @@ def clip_finetune_single_text_ance(
                     global_consistency_weight=intent_global_consistency_weight,
                     global_consistency_temperature=intent_global_consistency_temperature,
                     consistency_epsilon=intent_consistency_epsilon,
+                    consistency_mode=intent_consistency_mode,
                     return_stats=True,
                 )
                 weighted_loss_ic = intent_consistency_weight * loss_ic
@@ -1948,6 +1954,9 @@ if __name__ == "__main__":
                         help="Softmax temperature for weighting single-intent features in global consistency.")
     parser.add_argument("--intent-consistency-epsilon", type=float, default=0.05,
                         help="Hinge margin epsilon for local/global Intent Consistency Learning distance.")
+    parser.add_argument("--intent-consistency-mode", type=str, default="counterfactual_delta",
+                        choices=["counterfactual_delta", "counterfactual", "direction", "feature", "contrastive", "hybrid"],
+                        help="Intent consistency implementation: counterfactual deltas, edit-direction consistency, old cosine hinge, contrastive pairs, or hybrid.")
 
     # LoRA
     parser.add_argument("--use-lora", action="store_true")
@@ -2023,6 +2032,7 @@ if __name__ == "__main__":
         "intent_global_consistency_weight": args.intent_global_consistency_weight,
         "intent_global_consistency_temperature": args.intent_global_consistency_temperature,
         "intent_consistency_epsilon": args.intent_consistency_epsilon,
+        "intent_consistency_mode": args.intent_consistency_mode,
         "use_lora": args.use_lora,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
