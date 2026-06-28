@@ -1451,13 +1451,13 @@ def compute_intent_orthogonality_loss(
     Soft orthogonality loss between intents.
 
     For a multi-intent query T=(A_1, ..., A_k) with k >= 2, encourage the
-    retrieval-space edit directions produced by the fusion head for each single
+    retrieval-space query features produced by the fusion head for each single
     intent to be mutually orthogonal:
 
-        <f(I, A_i) - f(I, blank), f(I, A_j) - f(I, blank)> ~= 0    (i != j)
+        <f(I, A_i), f(I, A_j)> ~= 0    (i != j)
 
-    This encourages intent-specific changes, not the shared reference-image
-    component, to be disentangled. The
+    This encourages query representations for different intents to be
+    disentangled, so one intent is less likely to be pulled by another. The
     embeddings are first L2-normalized along the feature dimension, then the
     differentiable soft orthogonality penalty is computed as:
     2 / (K * (K - 1)) * sum_{i<j} (<e_i, e_j>)^2
@@ -1509,20 +1509,15 @@ def compute_intent_orthogonality_loss(
         # Isolated single-intent fusion outputs: [sum_k, D]
         single_query_features = fusion_module(repeated_ref_features, single_text_features)
 
-        selected_ref_features = ref_features[multi_indices]
-        with torch.no_grad():
-            ref_anchor_features = compose_image_features(model, selected_ref_features)
-
     losses = []
     offset = 0
     for j in range(len(multi_indices)):
         num_intents = len(multi_intent_texts[j])
         end = offset + num_intents
 
-        # Match the consistency loss isolated side: q_i - q_ref.
-        ref_anchor = ref_anchor_features[j].unsqueeze(0)
-        single_query_deltas = single_query_features[offset:end] - ref_anchor  # [k, D]
-        losses.append(_compute_soft_orthogonality_loss(single_query_deltas))
+        # Compute soft orthogonality directly from each single-intent fused query feature.
+        single_queries = single_query_features[offset:end]  # [k, D]
+        losses.append(_compute_soft_orthogonality_loss(single_queries))
 
         offset = end
 
